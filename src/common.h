@@ -4,16 +4,17 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <fcntl.h>      // For open
-#include <sys/mman.h>   // For mmap
-#include <unistd.h>     // For close
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 #define SHARED_FILE "shared_data.bin"
 #define DATA_OFFSET 0
 #define FLAG_OFFSET 64
 
-// 10ms per bit (Very slow, very safe for debugging)
+// 10ms per bit (Safe Debug Speed)
 #define SLOT_DURATION 10000000 
+#define CACHE_THRESHOLD 120
 
 static inline uint64_t rdtsc() {
     uint32_t lo, hi;
@@ -26,6 +27,7 @@ static inline void maccess(void *p) {
     (void)val;
 }
 
+// Blocks until the next global time grid line
 static inline uint64_t wait_for_next_slot() {
     uint64_t now = rdtsc();
     uint64_t next_slot = ((now / SLOT_DURATION) + 1) * SLOT_DURATION;
@@ -33,22 +35,11 @@ static inline uint64_t wait_for_next_slot() {
     return next_slot;
 }
 
-// NEW FUNCTION: Maps file with Read AND Write permissions
 static inline void *map_shared_rw(const char *path) {
-    int fd = open(path, O_RDWR); // Open as Read-Write
-    if (fd == -1) {
-        perror("Error opening file for RW");
-        exit(1);
-    }
-
-    // Map 4096 bytes (1 page) with Write permissions
+    int fd = open(path, O_RDWR);
+    if (fd == -1) { perror("open"); exit(1); }
     void *addr = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    close(fd); // We can close FD once mapped
-
-    if (addr == MAP_FAILED) {
-        perror("mmap failed");
-        exit(1);
-    }
+    close(fd);
     return addr;
 }
 
