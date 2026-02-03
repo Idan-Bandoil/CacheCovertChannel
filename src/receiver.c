@@ -8,11 +8,33 @@
 int main() {
     fr_t fr = fr_prepare();
     void *shared_mem = map_shared_rw(SHARED_FILE);
-    volatile uint8_t *sync_flag = (uint8_t *)(shared_mem + FLAG_OFFSET);
-    void *data_line = shared_mem + DATA_OFFSET;
+    
+    volatile uint8_t *sync_flag = (uint8_t *)(shared_mem + OFFSET_FLAG);
+    volatile uint8_t *msg_len   = (uint8_t *)(shared_mem + OFFSET_LEN);
+    void *data_line = shared_mem + OFFSET_DATA;
 
     fr_monitor(fr, data_line);
 
+    // 1. Read the length metadata FIRST
+    // (In a real attack, we'd assume a fixed size or a header, 
+    // but here we just read the memory location directly)
+    int length_to_receive = *msg_len;
+    
+    // Safety check in case sender hasn't started yet (defaults to 0)
+    if (length_to_receive == 0) {
+        printf("[RECEIVER] Waiting for Sender metadata...\n");
+        // Simple spin until sender writes a non-zero length
+        while(*msg_len == 0) asm volatile("nop");
+        length_to_receive = *msg_len;
+    }
+
+    printf("[RECEIVER] Metadata received. Expecting %d bytes.\n", length_to_receive);
+
+    // 2. Allocate buffer dynamically
+    char *final_message = malloc(length_to_receive + 1);
+    memset(final_message, 0, length_to_receive + 1);
+
+    // 3. Handshake
     printf("[RECEIVER] Setting READY flag...\n");
     *sync_flag = 1;
 
@@ -21,51 +43,35 @@ int main() {
     printf("[RECEIVER] Listening...\n");
     printf("Raw: ");
 
-    char final_message[20] = {0};
     uint8_t current_byte = 0;
     int bit_index = 0;
     int char_index = 0;
 
-    // Loop for 40 bits
-    for (int i = 0; i < 40; i++) {
+    // Loop exactly as many times as needed (Length * 8 bits)
+    int total_bits = length_to_receive * 8;
+
+    for (int i = 0; i < total_bits; i++) {
         
         int hits = 0;
-        int total_probes = 0;
-
-        // Start sampling 10% into the slot (skip edge noise)
+        
+        // Skip first 10% of slot (alignment guard)
         while (rdtsc() < current_slot_start + (SLOT_DURATION/10)) asm volatile("nop");
-
-        // Stop sampling 10% before the end
+        
+        // Sample until 90% of slot
         uint64_t sampling_end = current_slot_start + SLOT_DURATION - (SLOT_DURATION/10);
 
-        // --- OVERSAMPLING LOOP ---
         while (rdtsc() < sampling_end) {
             uint16_t res[1];
-            fr_probe(fr, res); // This measures AND flushes
+            fr_probe(fr, res);
             
-            if (res[0] < CACHE_THRESHOLD) {
-                hits++;
-            }
-            total_probes++;
-
-            // CRITICAL: Wait a tiny bit to let Sender put it back in!
-            // If we probe too fast, we flush faster than sender can write.
+            if (res[0] < CACHE_THRESHOLD) hits++;
+            
+            // Slow down probe slightly to allow sender refill
             for(volatile int k=0; k<2000; k++); 
         }
 
-        // --- DECISION LOGIC ---
-        // If the Sender was active, we should see MANY hits.
-        // If the Sender was idle, we might see 1 or 2 hits (noise), but not many.
-        
-        int bit = 0;
-        // If > 10 hits detected in this window, it's definitely a 1.
-        if (hits > 100) { 
-            bit = 1;
-        }
-
-        // Debug output (Shows Hit Count vs Total Probes)
-        // Uncomment this if you still have issues to see the "signal strength"
-        // printf("[%d/%d]", hits, total_probes); 
+        // Decision (Oversampling Threshold)
+        int bit = (hits > 10) ? 1 : 0;
 
         printf("%d", bit);
         fflush(stdout);
@@ -75,18 +81,19 @@ int main() {
 
         if (bit_index == 8) {
             final_message[char_index++] = current_byte;
-            printf("(%d) ", current_byte);
+            printf("(%c) ", current_byte); // Print char immediately
             fflush(stdout);
             bit_index = 0;
             current_byte = 0;
         }
 
-        // Wait for strict slot end
         while (rdtsc() < (current_slot_start + SLOT_DURATION)) asm volatile("nop");
         current_slot_start += SLOT_DURATION;
     }
 
-    printf("\n[RECEIVER] Result: %s\n", final_message);
+    printf("\n\n[RECEIVER] Final Decoded String: \"%s\"\n", final_message);
+    
+    free(final_message);
     fr_release(fr);
     return 0;
 }

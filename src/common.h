@@ -9,10 +9,13 @@
 #include <unistd.h>
 
 #define SHARED_FILE "shared_data.bin"
-#define DATA_OFFSET 0
-#define FLAG_OFFSET 64
 
-// 10ms per bit (Safe Debug Speed)
+// --- MEMORY LAYOUT ---
+#define OFFSET_DATA 0     // The Covert Channel Line
+#define OFFSET_FLAG 64    // Handshake Flag (Receiver -> Sender)
+#define OFFSET_LEN  128   // Metadata: Message Length (Sender -> Receiver)
+
+// 10ms per bit (Robust Speed)
 #define SLOT_DURATION 10000000 
 #define CACHE_THRESHOLD 120
 
@@ -27,7 +30,6 @@ static inline void maccess(void *p) {
     (void)val;
 }
 
-// Blocks until the next global time grid line
 static inline uint64_t wait_for_next_slot() {
     uint64_t now = rdtsc();
     uint64_t next_slot = ((now / SLOT_DURATION) + 1) * SLOT_DURATION;
