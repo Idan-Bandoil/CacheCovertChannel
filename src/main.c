@@ -13,6 +13,7 @@
 #define BUFFER_SIZE_MB (L3_SIZE_MB * 3)
 #define BUFFER_SIZE_BYTES (L3_SIZE_MB * 3 * 1024 * 1024)
 #define CACHE_LINE 64
+#define MINIMAL_RAM_ACCESS_CYCLES_THRESHOLD 180
 
 void maccess(void *p) {
     volatile uint32_t val = *(volatile uint32_t *)p;
@@ -23,7 +24,7 @@ int main() {
     printf("[*] specific Check: Cache Inclusion Policy (Using MASTIK)\n");
     printf("[*] Target CPU: Intel 12th Gen\n");
 
-    // 1. Setup MASTIK FR handle (used here for timing)
+    // 1. Setup MASTIK FR handle
     fr_t fr = fr_prepare();
     if (!fr) {
         fprintf(stderr, "Error initializing MASTIK\n");
@@ -57,14 +58,11 @@ int main() {
     for (int k = 0; k < iterations; k++) {
         // A. Load Target into L1/L2/L3
         maccess(target);
-        maccess(target); // Twice to be sure
 
         // B. Thrash L3
         // We scan the large buffer to force the L3 to fill with new data.
-        // Because 12th Gen uses RRIP, a single scan might be "scan resistant".
-        // We access each line to force eviction.
         for (int i = 0; i < BUFFER_SIZE_BYTES; i += CACHE_LINE) {
-            // SKIP the target itself (don't accidentally reload it!)
+            // SKIP the target itself so we don't reload it
             if ((uintptr_t)&buffer[i] == (uintptr_t)target) continue;
             
             // Access garbage line
@@ -72,14 +70,13 @@ int main() {
         }
 
         // C. Probe (Time the reload of Target)
-        // fr_probe measures time to access the monitored address.
+        // fr_probe measures time to access the monitored addresses.
         uint16_t results[1];
         fr_probe(fr, results);
         uint16_t latency = results[0];
 
         // D. Classify
-        // 180 cycles is a safe split between L2 (approx 40-80) and RAM (approx 200+)
-        if (latency > 180) {
+        if (latency > MINIMAL_RAM_ACCESS_CYCLES_THRESHOLD) {
             inclusive_count++;
         } else {
             non_inclusive_count++;
