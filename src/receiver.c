@@ -63,7 +63,7 @@ int main() {
 
         while (rdtsc() < sampling_end) {
             uint16_t res[1];
-            fr_probe(fr, res);
+            fr_probe(fr, res); // THIS ALSO FLUSHES
             
             if (res[0] < CACHE_THRESHOLD) hits++;
             
@@ -80,7 +80,10 @@ int main() {
         bit_index++;
 
         if (bit_index == 8) {
-            final_message[char_index++] = current_byte;
+            if ('\0' == current_byte)
+                final_message[char_index++] = '-';
+            else
+                final_message[char_index++] = current_byte;
             printf("(%c) ", current_byte);
             fflush(stdout);
             bit_index = 0;
