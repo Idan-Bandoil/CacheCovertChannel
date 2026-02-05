@@ -14,6 +14,7 @@
 #define OFFSET_DATA 0     // The Covert Channel Line
 #define OFFSET_FLAG 64    // Handshake Flag (Receiver -> Sender)
 #define OFFSET_LEN  128   // Metadata: Message Length (Sender -> Receiver)
+#define OFFSET_START_TIME 192 // When the sender and receiver must start sending and receiving
 
 // 10ms per bit (Robust Speed)
 #define SLOT_DURATION 10000000 

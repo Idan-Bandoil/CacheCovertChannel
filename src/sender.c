@@ -12,25 +12,40 @@ int main() {
     void *shared_mem = map_shared_rw(SHARED_FILE);
     volatile uint8_t *sync_flag = (uint8_t *)(shared_mem + OFFSET_FLAG);
     volatile uint8_t *msg_len   = (uint8_t *)(shared_mem + OFFSET_LEN);
+    volatile uint64_t *start_ts = (uint64_t *)(shared_mem + OFFSET_START_TIME);
     void *data_line = shared_mem + OFFSET_DATA;
 
     const char *msg = SECRET_MESSAGE;
     int length = strlen(msg);
 
-    // 1. Write the length to shared memory so receiver knows how much to read
+    // 1. Post Length
     printf("[SENDER] Message: \"%s\"\n", msg);
-    printf("[SENDER] Length: %d bytes. Posting metadata...\n", length);
     *msg_len = (uint8_t)length;
 
-    // 2. Wait for Receiver to acknowledge and be ready
+    // 2. Wait for Receiver (Handshake)
     printf("[SENDER] Waiting for Receiver...\n");
     while (*sync_flag != 1) asm volatile("nop");
 
-    // 3. Sync and Start
-    printf("[SENDER] Receiver ready. Transmitting...\n");
-    uint64_t current_slot_start = wait_for_next_slot();
+    // 3. SCHEDULE START TIME
+    // We set the start time to be NOW + 20 Slots (approx 200ms)
+    // This huge buffer gives both CPUs plenty of time to sync up.
+    uint64_t future_start = rdtsc() + (20 * SLOT_DURATION);
+    
+    // Write this time to shared memory so receiver knows it
+    *start_ts = future_start;
+    
+    // Signal that schedule is set (Reuse flag: 2 means "Time is set")
+    *sync_flag = 2;
 
-    // Loop through every byte of the dynamic message
+    printf("[SENDER] Scheduled Start: %lu. Waiting...\n", future_start);
+
+    // 4. Spin until the exact start second
+    while (rdtsc() < future_start) asm volatile("nop");
+
+    printf("[SENDER] Transmitting...\n");
+
+    uint64_t current_slot_start = future_start;
+
     for (int i = 0; i < length; i++) {
         char c = msg[i];
         for (int b = 7; b >= 0; b--) {
@@ -48,7 +63,7 @@ int main() {
         }
     }
     
-    *sync_flag = 0; // Reset flag
+    *sync_flag = 0; 
     printf("\n[SENDER] Finished.\n");
     return 0;
 }
