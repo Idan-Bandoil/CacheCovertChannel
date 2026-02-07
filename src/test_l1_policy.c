@@ -1,3 +1,5 @@
+#define _GNU_SOURCE
+#include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -16,6 +18,14 @@
 #define PCORE_L1_THRESHOLD 15
 #define ECORE_L1_THRESHOLD 25
 
+void set_cpu(uint16_t cpu_id) { 
+	cpu_set_t set;
+	CPU_ZERO(&set);        // clear cpu mask
+	CPU_SET(cpu_id, &set);      // set cpu 0
+	sched_setaffinity(0, sizeof(cpu_set_t), &set);
+	
+}
+
 static inline uint64_t rdtsc() {
     unsigned int lo, hi;
     __asm__ volatile ("rdtsc" : "=a" (lo), "=d" (hi));
@@ -29,6 +39,7 @@ int main(int argc, char **argv) {
     }
 
     int core_id = atoi(argv[1]);
+    set_cpu(core_id);
     uint64_t threshold = 0;
 
     if (core_id >= 0 && core_id <= 11) {
