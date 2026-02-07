@@ -1,11 +1,22 @@
 CC = gcc
-CFLAGS = -O3 -Wall
-SRC_POL = src/cache_policy_test.c
 
-all: cache_policy_test
+# Includes
+INCLUDES = -I/usr/local/include
 
-cache_policy_test: $(SRC_POL)
-	$(CC) $(CFLAGS) -o cache_policy_test $(SRC_POL)
+# Libraries (Must be linked at the end)
+LDFLAGS = -L/usr/local/lib
+LIBS = -lmastik -ldwarf -lelf
+
+CFLAGS = -O3 -Wall $(INCLUDES)
+
+SRC_POL = src/test_lru.c
+
+all: test_lru
+
+# The $(LIBS) are now at the end of the line
+test_lru: $(SRC_POL)
+	$(CC) $(CFLAGS) -o test_lru $(SRC_POL) $(LDFLAGS) $(LIBS)
 
 clean:
-	rm -f cache_policy_test
+	rm -f test_lru
+	
