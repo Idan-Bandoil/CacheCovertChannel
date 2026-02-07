@@ -1,2 +1,8 @@
 
 latency_profiler
+
+test_l1
+
+test_l3
+
+test_lru
