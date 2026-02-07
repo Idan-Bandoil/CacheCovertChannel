@@ -1,89 +1,107 @@
 #include <stdio.h>
-#include <stdint.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
-#include <x86intrin.h>
 
-#define SAMPLES 1000000
-#define HISTOGRAM_SIZE 500
+// Use MASTIK's low-level timing primitives
+// These provide the correct serialization (lfence) automatically
+#include <mastik/low.h> 
+
+#define SAMPLES 10000
+
+// Define Cache Sizes to Thrash (Adjust for your specific CPU if needed)
+// L1 is usually 32KB -> We use 64KB to be safe
+#define L1_SIZE (100 * 1024)
+#define L1_THRASH_SIZE (2 * L1_SIZE)
+
+// L2 is usually 256KB -> We use 512KB to be safe
+#define L2_SIZE (2 * 1024 * 1024)
+#define L2_THRASH_SIZE (2 * L2_SIZE)
+
+// Buffers for eviction
+uint8_t *l1_garbage;
+uint8_t *l2_garbage;
 
 static inline void maccess(void *p) {
     volatile uint32_t val = *(volatile uint32_t *)p;
     (void)val;
 }
 
-static inline uint64_t rdtsc() {
-    unsigned int lo, hi;
-    __asm__ volatile ("rdtsc" : "=a" (lo), "=d" (hi));
-    return ((uint64_t)hi << 32) | lo;
+// Helper: Clear L1 by reading a buffer larger than L1
+void flush_l1() {
+    for (int i = 0; i < L1_THRASH_SIZE; i += 64) {
+        maccess(l1_garbage + i);
+    }
+}
+
+// Helper: Clear L2 by reading a buffer larger than L2
+// Note: This also clears L1 automatically
+void flush_l2() {
+    for (int i = 0; i < L2_THRASH_SIZE; i += 64) {
+        maccess(l2_garbage + i);
+    }
 }
 
 int main(int argc, char **argv) {
-    // 1. Allocate a target variable
-    // Align to 64 bytes to fit perfectly in a cache line
-    uint8_t *data = (uint8_t *)malloc(4096);
-    uint8_t *target = data + 64; 
-    memset(data, 1, 4096);
+    // 1. Setup Data
+    uint8_t *target = (uint8_t *)malloc(4096);
+    *target = 1; // dummy write
+    
+    // Allocate garbage buffers
+    l1_garbage = (uint8_t *)malloc(L1_THRASH_SIZE);
+    l2_garbage = (uint8_t *)malloc(L2_THRASH_SIZE);
+    memset(l1_garbage, 1, L1_THRASH_SIZE);
+    memset(l2_garbage, 1, L2_THRASH_SIZE);
 
-    // Histogram to store cycle counts (0 to 499 cycles)
-    uint64_t histogram[HISTOGRAM_SIZE] = {0};
-    uint64_t total_cycles = 0;
-    uint64_t min_cycles = 999999;
-    uint64_t max_cycles = 0;
+    printf("[*] Profiling Memory Hierarchy Latency...\n");
+    printf("[*] Samples: %d\n\n", SAMPLES);
 
-    // 2. Warm Up
-    maccess(target);
+    uint64_t start, end;
+    uint64_t l1_total = 0, l2_total = 0, l3_total = 0, dram_total = 0;
 
-    // 3. Measurement Loop
     for (int i = 0; i < SAMPLES; i++) {
-        // Ensure data is in cache (Reload)
+        
+        // --- Measure L1 ---
+        maccess(target); // Ensure it's in L1
+        start = rdtscp();
         maccess(target);
-        
-        // Serialize execution (prevent out-of-order execution affecting timing)
-        _mm_lfence();
-        
-        uint64_t start = rdtsc();
-        maccess(target); // The Access we want to measure
-        uint64_t end = rdtsc();
-        
-        _mm_lfence();
+        end = rdtscp();
+        l1_total += (end - start);
 
-        uint64_t latency = end - start;
+        // --- Measure L2 ---
+        maccess(target); // Bring to L1
+        flush_l1();      // Evict from L1 -> Pushed to L2
+        
+        start = rdtscp();
+        maccess(target); // Miss L1 -> Hit L2
+        end = rdtscp();
+        l2_total += (end - start);
 
-        // Filter out noise (context switches)
-        if (latency < HISTOGRAM_SIZE) {
-            histogram[latency]++;
-            total_cycles += latency;
-            if (latency < min_cycles) min_cycles = latency;
-            if (latency > max_cycles) max_cycles = latency;
-        }
+        // --- Measure L3 ---
+        maccess(target); // Bring to L1
+        flush_l2();      // Evict from L1 & L2 -> Pushed to L3
+        
+        start = rdtscp();
+        maccess(target); // Miss L1 -> Miss L2 -> Hit L3
+        end = rdtscp();
+        l3_total += (end - start);
+
+        // --- Measure DRAM ---
+        clflush(target); // Flush from ALL caches
+        
+        start = rdtscp();
+        maccess(target); // Miss L1/L2/L3 -> Fetch from DRAM
+        end = rdtscp();
+        dram_total += (end - start);
     }
 
-    // 4. Calculate Stats
-    double avg_latency = (double)total_cycles / SAMPLES;
+    printf("Results (Average Cycles):\n");
+    printf("-------------------------\n");
+    printf("L1 Cache : %.2f cycles\n", (double)l1_total / SAMPLES);
+    printf("L2 Cache : %.2f cycles\n", (double)l2_total / SAMPLES);
+    printf("L3 Cache : %.2f cycles\n", (double)l3_total / SAMPLES);
+    printf("DRAM     : %.2f cycles\n", (double)dram_total / SAMPLES);
+    printf("-------------------------\n");
 
-    // Find the "Mode" (Most frequent latency)
-    uint64_t mode_cycles = 0;
-    uint64_t mode_count = 0;
-    for (int i = 0; i < HISTOGRAM_SIZE; i++) {
-        if (histogram[i] > mode_count) {
-            mode_count = histogram[i];
-            mode_cycles = i;
-        }
-    }
-
-    // 5. Output Results
-    printf("AVG:%.2f  MODE:%lu  MIN:%lu  MAX:%lu\n", 
-            avg_latency, mode_cycles, min_cycles, max_cycles);
-
-    // Optional: Print a mini ASCII histogram for visual verification
-    // printf("\nDistribution (Cycles : Count):\n");
-    // for (int i = 0; i < 150; i++) { // Only print first 150 buckets
-    //    if (histogram[i] > SAMPLES / 1000) { // Only print significant buckets
-    //        printf("%3d: %lu\n", i, histogram[i]);
-    //    }
-    // }
-
-    free(data);
     return 0;
 }
