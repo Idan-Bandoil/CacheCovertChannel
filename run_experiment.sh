@@ -21,6 +21,7 @@ get_core_type() {
 }
 
 # --- Compile ---
+# Ensure the path to src/latency_profiler.c is correct relative to where you run this script
 gcc src/latency_profiler.c -o latency_profiler -O3
 if [ $? -ne 0 ]; then echo "Compile failed."; exit 1; fi
 
@@ -30,7 +31,8 @@ e_n=0; e_l1=0; e_l2=0; e_l3=0; e_mem=0
 
 echo "Running Profiler..."
 
-for cpu_dir in /sys/devices/system/cpu/cpu[0-9]*; do
+# FIX: Use 'ls' combined with 'sort -V' to get numerical ordering (0, 1, 2... 10)
+for cpu_dir in $(ls -d /sys/devices/system/cpu/cpu[0-9]* | sort -V); do
     id=$(basename "$cpu_dir" | sed 's/cpu//')
     if ! [[ "$id" =~ ^[0-9]+$ ]]; then continue; fi
 
@@ -39,7 +41,7 @@ for cpu_dir in /sys/devices/system/cpu/cpu[0-9]*; do
     # Run and capture output
     out=$(taskset -c $id ./latency_profiler)
     
-    # FIX: Use different field indexes for Cache vs DRAM lines
+    # Extract values
     v1=$(echo "$out" | grep "L1 Cache" | awk '{printf "%.0f", $4}')
     v2=$(echo "$out" | grep "L2 Cache" | awk '{printf "%.0f", $4}')
     v3=$(echo "$out" | grep "L3 Cache" | awk '{printf "%.0f", $4}')
