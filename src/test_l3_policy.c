@@ -140,7 +140,7 @@ int main() {
         return 1;
     }
 
-    int evictions[TARGET_SET_SIZE];
+    int evictions[L3_WAYS];
     memset(evictions, 0, sizeof(evictions));
 
     printf("[*] Running Replacement Policy Test (%d Samples)...\n", SAMPLES);
@@ -160,7 +160,7 @@ int main() {
         maccess(eviction_set[L3_WAYS]);
         _mm_mfence();
 
-        for (int target = 0; target < TARGET_SET_SIZE; target++) {
+        for (int target = 0; target < L3_WAYS; target++) {
             if (is_cache_miss(eviction_set[target])) {
                 evictions[target]++;
                 break;
@@ -172,13 +172,12 @@ int main() {
     // --- Output ---
     printf("\n%-8s %-12s %-10s\n", "Index", "Evictions", "Prob");
     printf("------------------------------------\n");
-    for (int i = 0; i < TARGET_SET_SIZE; i++) {
+    for (int i = 0; i < L3_WAYS; i++) {
         double prob = (double)evictions[i] * 100.0 / SAMPLES;
         char note[50] = "";
         
         if (i == 0) strcpy(note, "<- Oldest (LRU?)");
         if (i == L3_WAYS - 1) strcpy(note, "<- Newest (MRU?)");
-        if (i == L3_WAYS) strcpy(note, "<- Intruder (Most Recent)");
 
         printf("Line %-3d %-12d %5.1f%% %s\n", i, evictions[i], prob, note);
     }
