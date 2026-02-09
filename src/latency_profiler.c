@@ -5,7 +5,7 @@
 #include <emmintrin.h>
 #include <mastik/low.h> 
 
-#define SAMPLES 10000
+#define SAMPLES 100000
 
 // --- Configuration ---
 #define L1_SIZE (100 * 1024)
@@ -73,7 +73,7 @@ int main(int argc, char **argv) {
         end = rdtscp();
         
         lat = end - start;
-        if (lat < 50 && lat > 20) { // Ignore extreme noise
+        if (lat < 50 && lat > 10) { // Ignore extreme noise
             l2_total += lat;
             l2_cnt++;
         }
@@ -87,7 +87,7 @@ int main(int argc, char **argv) {
         end = rdtscp();
         
         lat = end - start;
-        if (lat > 30 && lat < 120) { // Ignore extreme noise
+        if (lat > 30 && lat < 90) { // Ignore extreme noise
             l3_total += lat;
             l3_cnt++;
         }
@@ -101,7 +101,7 @@ int main(int argc, char **argv) {
         end = rdtscp();
         
         lat = end - start;
-        if (lat > 180) { // Ignore extreme noise
+        if (lat > 90 && lat < 1200) { // Ignore extreme noise
             dram_total += lat;
             dram_cnt++;
         }
