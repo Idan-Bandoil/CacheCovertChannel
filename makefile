@@ -1,20 +1,31 @@
 # --- Configuration ---
 CC       = gcc
-CFLAGS   = -O3 -pthread
+CFLAGS   = -Wall -Wextra -std=c11 -O3
+LDFLAGS  = -lrt -lm
 SRC_DIR  = src
 BIN_DIR  = .
 
+# --- Files ---
+SRCS     = $(SRC_DIR)/l3_overlap_test.c $(SRC_DIR)/PPT.c $(SRC_DIR)/utils.c
+OBJS     = $(SRCS:.c=.o)
+
 # --- Targets ---
-TARGETS  = l3_overlap_test
+TARGET   = l3_overlap_test
 
 # --- Rules ---
 
-all: $(TARGETS)
+all: $(TARGET)
 
-l3_overlap_test: $(SRC_DIR)/l3_overlap_test.c
-	$(CC) $(CFLAGS) $< -o $(BIN_DIR)/$@
+# 1. Linking Step:
+# Added $(LDFLAGS) here to link the math library
+$(TARGET): $(OBJS)
+	$(CC) $(CFLAGS) $(OBJS) -o $(BIN_DIR)/$@ $(LDFLAGS)
+
+# 2. Compilation Step:
+%.o: %.c
+	$(CC) $(CFLAGS) -c $< -o $@
 
 clean:
-	rm -f $(TARGETS)
+	rm -f $(TARGET) $(OBJS)
 
-.PHONY: all clean run
+.PHONY: all clean

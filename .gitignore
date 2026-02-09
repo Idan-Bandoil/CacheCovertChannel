@@ -8,3 +8,5 @@ test_l3
 test_l1
 
 test_lru
+
+*.o
