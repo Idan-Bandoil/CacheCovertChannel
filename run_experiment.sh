@@ -38,8 +38,9 @@ for cpu_dir in $(ls -d /sys/devices/system/cpu/cpu[0-9]* | sort -V); do
 
     type=$(get_core_type $id)
 
-    # Run and capture output
-    out=$(taskset -c $id ./latency_profiler)
+    # -f : Use SCHED_FIFO (First In, First Out)
+    # 99 : Priority 99 (Highest real-time priority)
+    out=$(chrt -f 99 taskset -c $id ./latency_profiler)
     
     # Extract values
     v1=$(echo "$out" | grep "L1 Cache" | awk '{printf "%.0f", $4}')

@@ -101,7 +101,7 @@ int main(int argc, char **argv) {
         end = rdtscp();
         
         lat = end - start;
-        if (lat > 90 && lat < 1200) { // Ignore extreme noise
+        if (lat > 90 && lat < 500) { // Ignore extreme noise
             dram_total += lat;
             dram_cnt++;
         }
