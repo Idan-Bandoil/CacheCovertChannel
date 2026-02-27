@@ -25,7 +25,7 @@
 // --- Configuration ---
 #define CACHE_WAYS 12           // Adjust for your P-Core (Usually 12 or 16)
 #define CACHE_SETS 32768        // 32K sets (Typical for large L3)
-#define POOL_SIZE_MB 128        
+#define POOL_SIZE_MB 40        
 #define RETRIES 3               
 #define BATCH_SIZE 550000       
 
@@ -231,17 +231,17 @@ int main(int argc, char **argv) {
     buffer_pool = mmap(NULL, pool_bytes, PROT_READ|PROT_WRITE, 
                        MAP_PRIVATE|MAP_ANONYMOUS|MAP_HUGETLB, -1, 0);
     if (buffer_pool == MAP_FAILED) {
-        printf("[!] HugePages failed. Using standard.\n");
+        printf("[!] HugePages failed with %d. Using standard.\n", errno);
         buffer_pool = mmap(NULL, pool_bytes, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+        if (buffer_pool == MAP_FAILED) {
+            printf("[!] Standard pages failed with %d. Using standard.\n", errno);
+        }
     }
     
     for (size_t i = 0; i < num_elements; i++) {
         buffer_pool[i].id = i;
         buffer_pool[i].next = NULL;
     }
-    
-    int *global_indices = malloc(num_elements * sizeof(int));
-    for(int i=0; i<num_elements; i++) global_indices[i] = i;
 
     unsigned char *status_map = calloc(num_elements, sizeof(unsigned char));
     int *batch_buffer = malloc(BATCH_SIZE * 2 * sizeof(int));
@@ -256,12 +256,12 @@ int main(int argc, char **argv) {
     while (sets_found < CACHE_SETS && current_scan_idx < num_elements) {
         
         // A. Pick Victim
-        while (current_scan_idx < num_elements && status_map[global_indices[current_scan_idx]]) {
+        while (current_scan_idx < num_elements && status_map[current_scan_idx]) {
             current_scan_idx++;
         }
         if (current_scan_idx >= num_elements) break;
 
-        int victim_idx = global_indices[current_scan_idx];
+        int victim_idx = current_scan_idx;
         elem_t *victim = &buffer_pool[victim_idx];
 
         // B. Form Batch
@@ -269,7 +269,7 @@ int main(int argc, char **argv) {
         int search_idx = current_scan_idx + 1;
         
         while (batch_count < BATCH_SIZE && search_idx < num_elements) {
-            int idx = global_indices[search_idx];
+            int idx = search_idx;
             if (!status_map[idx]) {
                 batch_buffer[batch_count++] = idx;
             }
