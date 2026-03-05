@@ -24,7 +24,7 @@
 #define CACHE_SETS 32768        // 2^15 sets
 #define SET_MASK 0x7FFF         // Mask for bits 6-20
 #define POOL_SIZE_MB 128        // Increased to ensure enough elements per bucket
-#define RETRIES 3               
+#define RETRIES 30               
 
 // --- Structures ---
 // EXTREMELY IMPORTANT: Pad the struct to exactly 64 bytes (1 Cache Line)
@@ -41,18 +41,41 @@ uint64_t threshold = 80;
 int latency_fd = -1;
 
 // --- System Tuning Functions ---
+
+/**
+ * @name    set_latency_target
+ * @purpose Locks the CPU into the C0 state by writing to /dev/cpu_dma_latency. 
+ * This prevents the processor from entering deep sleep states, which 
+ * would otherwise introduce massive latency spikes and ruin cache 
+ * timing measurements.
+ * @param   None
+ */
 void set_latency_target() {
     int32_t lat = 0; 
     latency_fd = open("/dev/cpu_dma_latency", O_RDWR);
     if (latency_fd != -1) write(latency_fd, &lat, sizeof(lat));
 }
 
+/**
+ * @name    set_realtime_priority
+ * @purpose Elevates the process scheduling priority to maximum (SCHED_FIFO, 99).
+ * This bypasses standard OS time-slicing and throttling, ensuring the
+ * timing loop is not interrupted by background system noise.
+ * @param   None
+ */
 void set_realtime_priority() {
     struct sched_param param;
     param.sched_priority = 99; 
     sched_setscheduler(0, SCHED_FIFO, &param);
 }
 
+/**
+ * @name    pin_cpu
+ * @purpose Binds the executing thread to a specific physical CPU core. 
+ * This is strictly required for targeting L3 cache slices and avoiding 
+ * cross-core migration noise, especially on P/E-Core hybrid architectures.
+ * @param   core_id  The integer ID of the physical core to pin the process to.
+ */
 void pin_cpu(int core_id) {
     cpu_set_t cpuset;
     CPU_ZERO(&cpuset);
@@ -61,6 +84,15 @@ void pin_cpu(int core_id) {
 }
 
 // --- Helpers ---
+
+/**
+ * @name    rdtsc
+ * @purpose Accurately reads the CPU's Time Stamp Counter (TSC). Uses `mfence` 
+ * instructions before and after the read to serialize execution and 
+ * prevent out-of-order execution from skewing the measurement.
+ * @param   None
+ * @return  The current 64-bit cycle count.
+ */
 static inline uint64_t rdtsc() {
     uint64_t a, d;
     asm volatile ("mfence");
@@ -69,31 +101,69 @@ static inline uint64_t rdtsc() {
     return (d << 32) | a;
 }
 
+/**
+ * @name    maccess
+ * @purpose Executes a dummy memory read at a specific address to force the 
+ * hardware to load the corresponding cache line into the CPU cache hierarchy.
+ * @param   p  Pointer to the memory address to be accessed.
+ */
 static inline void maccess(void *p) {
     asm volatile ("movq (%0), %%rax\n" : : "c" (p) : "rax");
 }
 
+/**
+ * @name    traverse_list
+ * @purpose Iterates through a linked list of memory elements, accessing each 
+ * one to load it into the cache. This is the primary mechanism for 
+ * priming the cache and forcing evictions.
+ * @param   head  Pointer to the first element in the linked list.
+ * @return  The total number of elements traversed.
+ */
 static int traverse_list(elem_t *head) {
     elem_t *p = head;
     int count = 0;
+
     while (p) {
         maccess(p);
         p = p->next;
         count++;
     }
+
     return count;
 }
 
+/**
+ * @name    time_access
+ * @purpose Measures the exact latency (in CPU cycles) of a single memory access.
+ * High latencies indicate a cache miss (eviction), while low latencies 
+ * indicate a cache hit.
+ * @param   addr  Pointer to the memory address to measure.
+ * @return  The latency of the memory access in CPU cycles.
+ */
 static inline uint64_t time_access(void *addr) {
     uint64_t start = rdtsc();
     maccess(addr);
     uint64_t end = rdtsc();
+
     return end - start;
 }
 
+/**
+ * @name    build_list_with_skip
+ * @purpose Dynamically constructs a linked list from an array of candidate indices,
+ * allowing a specific contiguous chunk of elements to be omitted. This is 
+ * the core list-building function used by the binary reduction algorithm.
+ * @param   base      The base pointer of the allocated memory pool.
+ * @param   indices   Array of integer indices pointing to candidate elements.
+ * @param   count     The total number of candidate indices provided.
+ * @param   skip_idx  The starting index within the array to begin skipping elements.
+ * @param   skip_len  The number of contiguous elements to skip.
+ * @return  A pointer to the head of the newly constructed linked list.
+ */
 elem_t* build_list_with_skip(elem_t *base, int *indices, int count, int skip_idx, int skip_len) {
     elem_t *head = NULL;
     elem_t *curr = NULL;
+
     for (int i = 0; i < count; i++) {
         if (skip_len > 0 && i >= skip_idx && i < skip_idx + skip_len) continue;
         if (!head) {
@@ -106,17 +176,27 @@ elem_t* build_list_with_skip(elem_t *base, int *indices, int count, int skip_idx
             curr = next;
         }
     }
+
     if (curr) curr->next = NULL;
+    
     return head;
 }
 
 // --- Eviction Testing ---
-int tests_eviction(elem_t *candidate_head, elem_t *victim) {
+
+/**
+ * @name    tests_eviction
+ * @purpose Evaluates whether accessing the provided candidate list successfully 
+ * evicts the victim address from the cache. Uses multiple retries to 
+ * filter out systemic noise and false positives.
+ * @param   candidate_head  The linked list of candidate memory addresses to access.
+ * @param   victim          The target memory address to test for eviction.
+ * @return  1 if the victim was successfully evicted (latency > threshold), 0 otherwise.
+ */
+int test_eviction(elem_t *candidate_head, elem_t *victim) {
     if (!candidate_head) return 0;
     int successes = 0;
     for (int r = 0; r < RETRIES; r++) {
-        traverse_list(candidate_head);
-        traverse_list(candidate_head); 
         maccess(victim);
         asm volatile("mfence");
         traverse_list(candidate_head);
@@ -127,9 +207,22 @@ int tests_eviction(elem_t *candidate_head, elem_t *victim) {
 }
 
 // --- Reduction ---
+
+/**
+ * @name    reduce_group
+ * @purpose Minimizes a large batch of candidate addresses into a minimal eviction 
+ * set (typically equal to CACHE_WAYS) that still successfully evicts the victim. 
+ * Uses an optimized, binary-search-like divide-and-conquer strategy.
+ * @param   base           The base pointer of the memory pool.
+ * @param   input_indices  Array containing the starting batch of candidate indices.
+ * @param   count          The total number of candidates in the input batch.
+ * @param   victim         The target address being evicted.
+ * @param   output_set     Buffer to store the final, minimized eviction set indices.
+ * @return  The size of the minimized eviction set (e.g., 12), or 0 if reduction failed.
+ */
 int reduce_group(elem_t *base, int *input_indices, int count, elem_t *victim, int *output_set) {
     elem_t *head = build_list_with_skip(base, input_indices, count, -1, 0); 
-    if (!tests_eviction(head, victim)) return 0;
+    if (!test_eviction(head, victim)) return 0;
 
     int current_set[1024]; // Max elements in a bucket won't exceed this
     memcpy(current_set, input_indices, count * sizeof(int));
@@ -146,7 +239,7 @@ int reduce_group(elem_t *base, int *input_indices, int count, elem_t *victim, in
                 continue;
             }
             head = build_list_with_skip(base, current_set, current_len, i, this_chunk);
-            if (tests_eviction(head, victim)) {
+            if (test_eviction(head, victim)) {
                 int tail_len = current_len - (i + this_chunk);
                 if (tail_len > 0) memmove(&current_set[i], &current_set[i + this_chunk], tail_len * sizeof(int));
                 current_len -= this_chunk;
