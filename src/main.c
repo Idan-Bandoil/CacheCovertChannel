@@ -26,8 +26,7 @@
 #define CACHE_SETS 4096         // Sets PER SLICE (2^12 sets) for i7-12700H
 #define SET_MASK 0xFFF          // Mask for exactly 12 bits (Bits 6-17)
 #define POOL_SIZE_MB 128        // Memory pool size
-#define RETRIES 10  
-#define CANDIDATES_PER_BUCKET 512             
+#define RETRIES 10               
 
 // --- Structures ---
 // EXTREMELY IMPORTANT: Pad the struct to exactly 64 bytes (1 Cache Line)
@@ -40,7 +39,7 @@ typedef struct elem {
 
 // --- Global Variables ---
 elem_t *buffer_pool;
-uint64_t threshold = 110; 
+uint64_t threshold = 150; 
 int latency_fd = -1;
 
 // --- System Tuning Functions ---
@@ -132,7 +131,7 @@ int enable_hugepages(int required_mb) {
 void set_latency_target() {
     int32_t lat = 0; 
     latency_fd = open("/dev/cpu_dma_latency", O_RDWR);
-    if (latency_fd != -1){
+    if (latency_fd != -1) {
         if (!write(latency_fd, &lat, sizeof(lat)))
             exit(1);
     }
@@ -197,6 +196,7 @@ static inline uint64_t time_access(void *addr) {
     uint64_t end = rdtsc_end();
     return end - start;
 }
+
 /**
  * @name    traverse_list
  * @purpose Iterates through a linked list of memory elements, accessing each 
@@ -252,24 +252,6 @@ elem_t* build_list_with_skip(elem_t *base, int *indices, int count, int skip_idx
     return head;
 }
 
-/**
- * @name    build_list_from_indices
- * @purpose Creates a linked list directly from an array of known indices.
- */
-elem_t* build_list_from_indices(elem_t *base, int *indices, int count) {
-    if (count == 0) return NULL;
-    elem_t *head = &base[indices[0]];
-    elem_t *curr = head;
-    for(int i = 1; i < count; i++) {
-        elem_t *next = &base[indices[i]];
-        curr->next = next;
-        next->prev = curr;
-        curr = next;
-    }
-    curr->next = NULL;
-    return head;
-}
-
 // --- Eviction Testing ---
 
 /**
@@ -288,8 +270,10 @@ int tests_eviction(elem_t *candidate_head, elem_t *victim) {
         maccess(victim);
         __asm__ volatile("mfence");
         traverse_list(candidate_head);
+        traverse_list(candidate_head); 
         __asm__ volatile("mfence");
-        if (time_access(victim) > threshold) successes++;
+        uint64_t time = time_access(victim);
+        if (time > threshold) successes++;
     }
     return (successes > RETRIES / 2);
 }
@@ -320,7 +304,6 @@ int reduce_group(elem_t *base, int *input_indices, int count, elem_t *victim, in
     while (chunk_size >= 1) {
         int i = 0;
         int progress_made = 0;
-
         while (i < current_len) {
             int this_chunk = (i + chunk_size > current_len) ? (current_len - i) : chunk_size;
             if ((current_len - this_chunk) < CACHE_WAYS) {
@@ -347,42 +330,6 @@ cleanup:
         return current_len;
     }
     return 0;
-}
-
-/**
- * @name    calibrate_threshold
- * @purpose Measures average L3 hit latency vs Main Memory latency to 
- * dynamically calculate the perfect eviction threshold.
- */
-void calibrate_threshold() {
-    elem_t *target = &buffer_pool[0]; 
-    uint64_t hit_total = 0, miss_total = 0;
-    int rounds = 100000;
-
-    // Warm up the pipeline and cache
-    for(int i = 0; i < 1000; i++) maccess(target);
-
-    for (int i = 0; i < rounds; i++) {
-        // Measure Cache Hit
-        maccess(target); // Guarantee it's in L3
-        hit_total += time_access(target);
-
-        // Measure Cache Miss (Main Memory)
-        __asm__ volatile("clflush (%0)" : : "r" (target) : "memory");
-        __asm__ volatile("mfence"); // mfence is STILL NEEDED HERE to ensure clflush finishes!
-        miss_total += time_access(target);
-    }
-
-    uint64_t avg_hit = hit_total / rounds;
-    uint64_t avg_miss = miss_total / rounds;
-    
-    // Set threshold perfectly in the middle
-    threshold = (avg_hit + avg_miss) / 2;
-
-    printf("[*] Calibration complete:\n");
-    printf("    -> Avg L3 Hit:   %lu cycles\n", avg_hit);
-    printf("    -> Avg RAM Miss: %lu cycles\n", avg_miss);
-    printf("    -> Threshold set to: %lu cycles\n\n", threshold);
 }
 
 int main(int argc, char **argv) {
@@ -418,25 +365,23 @@ int main(int argc, char **argv) {
         return 1; 
     }
     
-    // calibrate_threshold();
-
     for (size_t i = 0; i < num_elements; i++) {
         buffer_pool[i].id = i;
         buffer_pool[i].next = NULL;
     }
 
-    // --- BUCKETING LOGIC ---
+    // --- NEW: BUCKETING LOGIC ---
     printf("[*] Bucketing addresses by Cache Set Index...\n");
     int **buckets = malloc(CACHE_SETS * sizeof(int*));
     int *bucket_counts = calloc(CACHE_SETS, sizeof(int));
     for(int i=0; i<CACHE_SETS; i++) {
-        buckets[i] = malloc(CANDIDATES_PER_BUCKET * sizeof(int)); // Safely hold candidates
+        buckets[i] = malloc(512 * sizeof(int)); // Safely hold candidates
     }
 
     for (size_t i = 0; i < num_elements; i++) {
         uintptr_t addr = (uintptr_t)&buffer_pool[i];
         int set_idx = (addr >> 6) & SET_MASK; // Shift out 64-byte line, mask the 12 index bits for 4096 sets
-        if (bucket_counts[set_idx] < CANDIDATES_PER_BUCKET) {
+        if (bucket_counts[set_idx] < 512) {
             buckets[set_idx][bucket_counts[set_idx]++] = i;
         }
     }
@@ -452,71 +397,29 @@ int main(int argc, char **argv) {
         int candidates_available = bucket_counts[set_idx];
         int *current_bucket = buckets[set_idx];
 
-        // Storage for the exact slices we find for THIS specific Set Index
-        int local_es_buffers[8][CACHE_WAYS]; 
-        int slices_found_for_this_index = 0;
-
-        printf("Set index = %d\n", set_idx);
-
-        // Loop until we find all 8 slices OR we run out of candidate addresses
-        while (candidates_available > CACHE_WAYS && slices_found_for_this_index < 8) {            
-            // 1. Pick a victim from the end and remove it from the candidate pool
+        // Within this index, try to find sets (representing different slices)
+        while (candidates_available > CACHE_WAYS) {
+            
+            // Pick a victim from the end of the bucket
             int victim_idx = current_bucket[candidates_available - 1];
             elem_t *victim = &buffer_pool[victim_idx];
-            candidates_available--; // Shrink candidate pool
-            
-            int batch_size = candidates_available;
-            
-            // 2. PRUNING: Check if this victim maps to a slice we already found
-            int already_mapped = 0;
-            for (int i = 0; i < slices_found_for_this_index && !already_mapped; i++) {
-                elem_t *known_set_head = build_list_from_indices(buffer_pool, local_es_buffers[i], CACHE_WAYS);
-                
-                // If a known set evicts this victim, they share the same slice!
-                if (tests_eviction(known_set_head, victim)) {
-                    already_mapped = 1;
-                }
-            }
 
-            // If we already mapped this slice, skip the heavy reduction
-            if (already_mapped) {
-                continue; 
-            }
-
-            // 3. REDUCE! This victim belongs to a NEW, undiscovered slice.
+            // Use the rest of the bucket as candidates
+            int batch_size = candidates_available - 1;
+            
+            // REDUCE! Notice how fast this is, batch_size is only ~64 addresses!
             int es_size = reduce_group(buffer_pool, current_bucket, batch_size, victim, es_buffer);
 
             if (es_size >= CACHE_WAYS) {
-                // Save it to our local slice tracker
-                memcpy(local_es_buffers[slices_found_for_this_index], es_buffer, CACHE_WAYS * sizeof(int));
-                slices_found_for_this_index++;
-                
                 sets_found++;
-                if (sets_found % 1000 == 0) {
-                     printf("[+] Found %d unique slices... (%ld sec)\n", sets_found, time(NULL) - start_time);
+                if (sets_found % 100 == 0) {
+                     printf("[+] Found %d sets... (%ld sec)\n", sets_found, time(NULL) - start_time);
                 }
 
-                // 4. Filter the found eviction set members OUT of the candidate bucket
-                int temp_bucket[CANDIDATES_PER_BUCKET]; 
-                int temp_count = 0;
-
-                for (int i = 0; i < candidates_available; i++) {
-                    int is_in_es = 0;
-                    for (int j = 0; j < es_size; j++) {
-                        if (current_bucket[i] == es_buffer[j]) {
-                            is_in_es = 1;
-                            break;
-                        }
-                    }
-                    // Keep it only if it wasn't used in the eviction set
-                    if (!is_in_es) {
-                        temp_bucket[temp_count++] = current_bucket[i];
-                    }
-                }
-
-                // Overwrite the bucket with the remaining, unused candidates
-                memcpy(current_bucket, temp_bucket, temp_count * sizeof(int));
-                candidates_available = temp_count;
+                candidates_available -= (es_size + 1); // remove victim and set
+                break; // NOTE: We break here to just find 1 slice per index. Remove `break` to map ALL slices.
+            } else {
+                break; 
             }
         }
     }

@@ -1,5 +1,5 @@
 CC = gcc
-CFLAGS = -g -O3 -std=c11 -Wall -I/usr/local/include -I./src
+CFLAGS = -g -O0 -flto -march=native -std=c11 -Wall -I/usr/local/include -I./src
 LDFLAGS = -lrt -lm
 
 all: main
