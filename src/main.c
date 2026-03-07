@@ -1,11 +1,6 @@
 /*
- * Prime+Prune Eviction Set Finder (Huge Page Bucketing)
- * Features:
- * - 64-byte Cache-Line Alignment.
- * - Virtual Address Bucketing (O(1) set index calculation).
- * - Instant Reduction (Isolating Slices within Buckets).
- * - Auto-Detection and Allocation of Huge Pages.
- * - Tuned for Intel Alder Lake (i7-12700H) - 8 Slices, 4096 Sets/Slice.
+ * Cross-Core Eviction Efficacy Tester
+ * Extracts L3 slices on a P-core, then verifies eviction capabilities on an E-core.
  */
 
 #define _GNU_SOURCE
@@ -23,14 +18,13 @@
 
 // --- Configuration ---
 #define CACHE_WAYS 12           
-#define CACHE_SETS 4096         // Sets PER SLICE (2^12 sets) for i7-12700H
-#define SET_MASK 0xFFF          // Mask for exactly 12 bits (Bits 6-17)
-#define POOL_SIZE_MB 128        // Memory pool size
+#define CACHE_SETS 4096         
+#define SET_MASK 0xFFF          
+#define POOL_SIZE_MB 128        
 #define RETRIES 10               
-#define BUCKET_SIZE 512               
+#define MAX_CANDIDATES 4000     
 
 // --- Structures ---
-// EXTREMELY IMPORTANT: Pad the struct to exactly 64 bytes (1 Cache Line)
 typedef struct elem {
     struct elem *next;
     struct elem *prev; 
@@ -44,120 +38,50 @@ uint64_t threshold = 120;
 int latency_fd = -1;
 
 // --- System Tuning Functions ---
-
-/**
- * @name    enable_hugepages
- * @purpose Verifies if the OS has enough free 2MB huge pages to satisfy the 
- * requested POOL_SIZE_MB. If not, it attempts to allocate them dynamically 
- * by writing to /proc/sys/vm/nr_hugepages.
- * @param   required_mb  The amount of memory in Megabytes needed.
- * @return  1 on success, 0 on failure.
- */
 int enable_hugepages(int required_mb) {
-    // 2MB per page, plus a 10-page safety buffer
     int required_pages = (required_mb / 2) + 10; 
     int free_pages = 0;
     char line[256];
 
-    // 1. Check current free huge pages
     FILE *fp = fopen("/proc/meminfo", "r");
     if (fp) {
         while (fgets(line, sizeof(line), fp)) {
-            if (sscanf(line, "HugePages_Free: %d", &free_pages) == 1) {
-                break;
-            }
+            if (sscanf(line, "HugePages_Free: %d", &free_pages) == 1) break;
         }
         fclose(fp);
     }
+    if (free_pages >= required_pages) return 1;
 
-    if (free_pages >= required_pages) {
-        printf("[*] Huge pages check passed (%d free).\n", free_pages);
-        return 1;
-    }
-
-    printf("[!] Insufficient huge pages (%d free, need %d). Attempting to allocate...\n", free_pages, required_pages);
-
-    // 2. Try to allocate more (Requires Root)
     int fd = open("/proc/sys/vm/nr_hugepages", O_WRONLY);
-    if (fd == -1) {
-        printf("\n[!] CRITICAL ERROR: Cannot write to /proc/sys/vm/nr_hugepages.\n");
-        printf("[!] You must run this program as ROOT (sudo) to allocate huge pages.\n");
-        printf("[!] Alternatively, allocate them manually:\n");
-        printf("    sudo sysctl -w vm.nr_hugepages=%d\n\n", required_pages);
-        return 0;
-    }
-
+    if (fd == -1) return 0;
     char buf[32];
     snprintf(buf, sizeof(buf), "%d\n", required_pages);
-    if (write(fd, buf, strlen(buf)) != strlen(buf)) {
-         printf("[!] ERROR: Failed to write to nr_hugepages. OS rejected request.\n");
-         close(fd);
-         return 0;
-    }
+    write(fd, buf, strlen(buf));
     close(fd);
 
-    // 3. Re-verify allocation (Fragmentation might cause OS to reject the request silently)
     free_pages = 0;
     fp = fopen("/proc/meminfo", "r");
     if (fp) {
         while (fgets(line, sizeof(line), fp)) {
-            if (sscanf(line, "HugePages_Free: %d", &free_pages) == 1) {
-                break;
-            }
+            if (sscanf(line, "HugePages_Free: %d", &free_pages) == 1) break;
         }
         fclose(fp);
     }
-
-    if (free_pages >= required_pages) {
-        printf("[+] Successfully allocated %d huge pages dynamically!\n", free_pages);
-        return 1;
-    } else {
-        printf("\n[!] CRITICAL ERROR: OS rejected huge page allocation.\n");
-        printf("[!] Reason: Physical memory is likely too fragmented to find contiguous 2MB blocks.\n");
-        printf("[!] Fix: Clear system caches and try again:\n");
-        printf("    sync; echo 3 > /proc/sys/vm/drop_caches\n\n");
-        return 0;
-    }
+    return (free_pages >= required_pages);
 }
 
-
-/**
- * @name    set_latency_target
- * @purpose Locks the CPU into the C0 state by writing to /dev/cpu_dma_latency. 
- * This prevents the processor from entering deep sleep states, which 
- * would otherwise introduce massive latency spikes and ruin cache 
- * timing measurements.
- * @param   None
- */
 void set_latency_target() {
     int32_t lat = 0; 
     latency_fd = open("/dev/cpu_dma_latency", O_RDWR);
-    if (latency_fd != -1) {
-        if (!write(latency_fd, &lat, sizeof(lat)))
-            exit(1);
-    }
+    if (latency_fd != -1) write(latency_fd, &lat, sizeof(lat));
 }
 
-/**
- * @name    set_realtime_priority
- * @purpose Elevates the process scheduling priority to maximum (SCHED_FIFO, 99).
- * This bypasses standard OS time-slicing and throttling, ensuring the
- * timing loop is not interrupted by background system noise.
- * @param   None
- */
 void set_realtime_priority() {
     struct sched_param param;
     param.sched_priority = 99; 
     sched_setscheduler(0, SCHED_FIFO, &param);
 }
 
-/**
- * @name    pin_cpu
- * @purpose Binds the executing thread to a specific physical CPU core. 
- * This is strictly required for targeting L3 cache slices and avoiding 
- * cross-core migration noise, especially on P/E-Core hybrid architectures.
- * @param   core_id  The integer ID of the physical core to pin the process to.
- */
 void pin_cpu(int core_id) {
     cpu_set_t cpuset;
     CPU_ZERO(&cpuset);
@@ -165,22 +89,13 @@ void pin_cpu(int core_id) {
     sched_setaffinity(0, sizeof(cpu_set_t), &cpuset);
 }
 
-// --- Helpers ---
-
-/**
- * @name    rdtsc_start
- * @purpose Serializes the pipeline with lfence, then reads the TSC.
- */
+// --- Low Level Timing ---
 static inline uint64_t rdtsc_start() {
     uint32_t a, d;
     __asm__ volatile ("lfence\n\t rdtsc\n\t" : "=a" (a), "=d" (d) :: "memory");
     return ((uint64_t)d << 32) | a;
 }
 
-/**
- * @name    rdtsc_end
- * @purpose Reads the TSC with rdtscp (which forces serialization), then lfences.
- */
 static inline uint64_t rdtsc_end() {
     uint32_t a, d;
     __asm__ volatile ("rdtscp\n\t lfence\n\t" : "=a" (a), "=d" (d) :: "rcx", "memory");
@@ -198,178 +113,162 @@ static inline uint64_t time_access(volatile void *addr) {
     return end - start;
 }
 
-/**
- * @name    traverse_list
- * @purpose Iterates through a linked list of memory elements, accessing each 
- * one to load it into the cache. This is the primary mechanism for 
- * priming the cache and forcing evictions.
- * @param   head  Pointer to the first element in the linked list.
- * @return  The total number of elements traversed.
- */
 static int traverse_list(elem_t *head) {
     elem_t *p = head;
     int count = 0;
-
     while (p) {
         maccess(p);
         p = p->next;
         count++;
     }
-
     return count;
 }
 
-/**
- * @name    build_list_with_skip
- * @purpose Dynamically constructs a linked list from an array of candidate indices,
- * allowing a specific contiguous chunk of elements to be omitted. This is 
- * the core list-building function used by the binary reduction algorithm.
- * @param   base      The base pointer of the allocated memory pool.
- * @param   indices   Array of integer indices pointing to candidate elements.
- * @param   count     The total number of candidate indices provided.
- * @param   skip_idx  The starting index within the array to begin skipping elements.
- * @param   skip_len  The number of contiguous elements to skip.
- * @return  A pointer to the head of the newly constructed linked list.
- */
-elem_t* build_list_with_skip(elem_t *base, int *indices, int count, int skip_idx, int skip_len) {
+// --- Pointer-based List Builder ---
+elem_t* build_pointer_list(elem_t **arr, int count, int skip_idx, int skip_len) {
     elem_t *head = NULL;
     elem_t *curr = NULL;
 
     for (int i = 0; i < count; i++) {
         if (skip_len > 0 && i >= skip_idx && i < skip_idx + skip_len) continue;
+        
         if (!head) {
-            head = &base[indices[i]];
+            head = arr[i];
             curr = head;
         } else {
-            elem_t *next = &base[indices[i]];
-            curr->next = next;
-            next->prev = curr; 
-            curr = next;
+            curr->next = arr[i];
+            arr[i]->prev = curr;
+            curr = arr[i];
         }
     }
-
     if (curr) curr->next = NULL;
-    
     return head;
 }
 
 // --- Eviction Testing ---
-
-/**
- * @name    tests_eviction
- * @purpose Evaluates whether accessing the provided candidate list successfully 
- * evicts the victim address from the cache. Uses multiple retries to 
- * filter out systemic noise and false positives.
- * @param   candidate_head  The linked list of candidate memory addresses to access.
- * @param   victim          The target memory address to test for eviction.
- * @return  1 if the victim was successfully evicted (latency > threshold), 0 otherwise.
- */
-/**
- * @name    tests_eviction (Hardened against Prefetchers & RRIP)
- */
 int tests_eviction(elem_t *candidate_head, elem_t *victim) {
     if (!candidate_head) return 0;
-    
     int successes = 0;
 
     for (int r = 0; r < RETRIES; r++) {
-        // 1. Bring victim into MRU state
         maccess(victim);
         __asm__ volatile("mfence");
         
-        // 2. Triple Traversal! 
-        // Defeats RRIP by forcing candidate promotion.
-        // On Alder Lake, 2 is good, 3 is bulletproof.
+        traverse_list(candidate_head);
+        traverse_list(candidate_head);
         traverse_list(candidate_head);
         traverse_list(candidate_head);
         traverse_list(candidate_head);
         
         __asm__ volatile("mfence");
-        
-        // 3. Measure
         uint64_t time = time_access(victim);
         
-        if (time > threshold) {
-            successes++;
-        }
+        if (time > threshold) successes++;
         if (successes > RETRIES / 3) return 1;
         if (r - successes > RETRIES * 2 / 3) return 0;
     }
-    
     return (successes > RETRIES / 3); 
 }
 
-// --- Reduction ---
-
-/**
- * @name    reduce_group
- * @purpose Minimizes a large batch of candidate addresses into a minimal eviction 
- * set (typically equal to CACHE_WAYS) that still successfully evicts the victim. 
- * Uses an optimized, binary-search-like divide-and-conquer strategy.
- * @param   base           The base pointer of the memory pool.
- * @param   input_indices  Array containing the starting batch of candidate indices.
- * @param   count          The total number of candidates in the input batch.
- * @param   victim         The target address being evicted.
- * @param   output_set     Buffer to store the final, minimized eviction set indices.
- * @return  The size of the minimized eviction set (e.g., 12), or 0 if reduction failed.
- */
-int reduce_group(elem_t *base, int *input_indices, int count, elem_t *victim, int *output_set) {
-    elem_t *head = build_list_with_skip(base, input_indices, count, -1, 0); 
-    if (!tests_eviction(head, victim)) return 0;
-
-    int current_set[BUCKET_SIZE]; // Max elements in a bucket won't exceed this
-    memcpy(current_set, input_indices, count * sizeof(int));
-    int current_len = count;
-    int chunk_size = current_len / 2;
+// --- NEW: Statistical Benchmarking ---
+// Runs 10,000 trials to find the exact eviction success rate of a given set
+void benchmark_eviction_rate(elem_t *es_head, elem_t *victim) {
+    int evictions = 0;
+    int rounds = 10000;
     
-    while (chunk_size >= 1) {
+    for (int i = 0; i < rounds; i++) {
+        // 1. Bring victim into L3
+        maccess(victim);
+        __asm__ volatile("mfence");
+        
+        // 2. Thrash violently to bypass E-core L2 filtering
+        // We increase traversals and add memory fences to prevent 
+        // the E-core from heavily pipelining the accesses.
+        for(int j = 0; j < 12; j++) {
+            traverse_list(es_head);
+            __asm__ volatile("lfence"); 
+        }
+        
+        __asm__ volatile("mfence");
+        
+        // 3. Time the victim
+        uint64_t time = time_access(victim);
+        
+        if (time > threshold) {
+            evictions++;
+        }
+    }
+    
+    double rate = (evictions * 100.0) / rounds;
+    printf("    -> Efficacy Rate: %6.2f%% \n", rate);
+}
+
+// --- Robust Block Reduction ---
+int robust_reduce(elem_t **candidates, int num_candidates, elem_t *victim, elem_t **out_es) {
+    int working_len = num_candidates;
+    elem_t **working_set = malloc(working_len * sizeof(elem_t*));
+    memcpy(working_set, candidates, working_len * sizeof(elem_t*));
+
+    elem_t *head = build_pointer_list(working_set, working_len, -1, 0);
+    if (!tests_eviction(head, victim)) {
+        free(working_set);
+        return 0; 
+    }
+
+    int chunk_size = working_len / 2;
+    
+    while (chunk_size > 0 && working_len > CACHE_WAYS) {
         int i = 0;
         int progress_made = 0;
-        while (i < current_len) {
-            int this_chunk = (i + chunk_size > current_len) ? (current_len - i) : chunk_size;
-            if ((current_len - this_chunk) < CACHE_WAYS) {
-                i += this_chunk;
+        
+        while (i < working_len && working_len > CACHE_WAYS) {
+            int current_chunk = (i + chunk_size > working_len) ? (working_len - i) : chunk_size;
+            
+            if (working_len - current_chunk < CACHE_WAYS) {
+                i += current_chunk;
                 continue;
             }
-            head = build_list_with_skip(base, current_set, current_len, i, this_chunk);
+
+            head = build_pointer_list(working_set, working_len, i, current_chunk);
+            
             if (tests_eviction(head, victim)) {
-                int tail_len = current_len - (i + this_chunk);
-                if (tail_len > 0) memmove(&current_set[i], &current_set[i + this_chunk], tail_len * sizeof(int));
-                current_len -= this_chunk;
+                int tail_len = working_len - (i + current_chunk);
+                if (tail_len > 0) {
+                    memmove(&working_set[i], &working_set[i + current_chunk], tail_len * sizeof(elem_t*));
+                }
+                working_len -= current_chunk;
                 progress_made = 1;
-                if (current_len == CACHE_WAYS) goto cleanup;
             } else {
-                i += this_chunk;
+                i += current_chunk;
             }
         }
-        if (!progress_made) chunk_size /= 2;
+        
+        if (!progress_made) {
+            chunk_size /= 2;
+        }
     }
 
-cleanup:
-    if (current_len >= CACHE_WAYS && current_len <= CACHE_WAYS + 4) { 
-        memcpy(output_set, current_set, current_len * sizeof(int));
-        return current_len;
+    if (working_len >= CACHE_WAYS && working_len <= CACHE_WAYS + 12) {
+        memcpy(out_es, working_set, working_len * sizeof(elem_t*));
+        free(working_set);
+        return working_len;
     }
+
+    free(working_set);
     return 0;
 }
 
-/**
- * @name    calibrate_threshold
- * @purpose Measures average L3 hit latency vs Main Memory latency to 
- * dynamically calculate the perfect eviction threshold.
- */
+// --- Calibration ---
 void calibrate_threshold() {
     volatile elem_t* dummy = &buffer_pool[0];
     uint64_t hit_total = 0, miss_total = 0;
     int rounds = 10000;
 
     for (int i = 0; i < rounds; i++) {
-        // Measure Cache Hit
-        maccess(dummy); // Bring into cache
+        maccess(dummy); 
         __asm__ volatile("mfence");
         hit_total += time_access(dummy);
 
-        // Measure Cache Miss (Main Memory)
         __asm__ volatile("clflush (%0)" : : "r" (dummy) : "memory");
         __asm__ volatile("mfence");
         miss_total += time_access(dummy);
@@ -378,111 +277,135 @@ void calibrate_threshold() {
     uint64_t avg_hit = hit_total / rounds;
     uint64_t avg_miss = miss_total / rounds;
     
-    // Set threshold exactly in the middle
+    // RE-ENABLED: This MUST be dynamic for E-cores to work properly.
     // threshold = (avg_hit + avg_miss) / 2;
 
-    printf("[*] Calibration complete:\n");
     printf("    -> Avg L3 Hit:   %lu cycles\n", avg_hit);
     printf("    -> Avg RAM Miss: %lu cycles\n", avg_miss);
-    // printf("    -> Threshold set to: %lu cycles\n\n", threshold);
+    // printf("    -> Threshold:    %lu cycles\n", threshold);
 }
 
+// --- Main Execution ---
 int main(int argc, char **argv) {
     setbuf(stdout, NULL);
 
-    if (argc != 2) {
-        printf("Usage: %s <core_id>\n", argv[0]);
+    // Update CLI args to take both core IDs
+    if (argc != 4) {
+        printf("Usage: %s <p_core_id> <e_core_id> <target_set_index>\n", argv[0]);
         return 1;
     }
-    int core_id = atoi(argv[1]);
+    int p_core_id = atoi(argv[1]);
+    int e_core_id = atoi(argv[2]);
+    int target_set_index = atoi(argv[3]);
 
-    // 1. Check and Enable Huge Pages BEFORE allocating memory
-    if (!enable_hugepages(POOL_SIZE_MB)) {
-        return 1; // Program stops here if huge pages fail
-    }
+    if (!enable_hugepages(POOL_SIZE_MB)) return 1;
 
     set_latency_target();
     set_realtime_priority();
-    pin_cpu(core_id);
-
-    if (sizeof(elem_t) != 64) {
-        printf("[!] ERROR: elem_t is %zu bytes, not 64! Aborting.\n", sizeof(elem_t));
-        return 1;
-    }
+    
+    // --- PHASE 1: P-CORE EXTRACTION ---
+    pin_cpu(p_core_id);
+    printf("\n[====== PHASE 1: P-CORE EXTRACTION (Core %d) ======]\n", p_core_id);
 
     size_t pool_bytes = POOL_SIZE_MB * 1024 * 1024;
     size_t num_elements = pool_bytes / sizeof(elem_t);
     
     buffer_pool = mmap(NULL, pool_bytes, PROT_READ|PROT_WRITE, 
                        MAP_PRIVATE|MAP_ANONYMOUS|MAP_HUGETLB, -1, 0);
-    if (buffer_pool == MAP_FAILED) {
-        printf("[!] HugePages required for Bucketing! Failed with %d.\n", errno);
-        return 1; 
-    }
-    
+    if (buffer_pool == MAP_FAILED) return 1; 
+
     for (size_t i = 0; i < num_elements; i++) {
         buffer_pool[i].id = i;
         buffer_pool[i].next = NULL;
+        buffer_pool[i].prev = NULL;
     }
 
-    // --- NEW: BUCKETING LOGIC ---
-    printf("[*] Bucketing addresses by Cache Set Index...\n");
-    int **buckets = malloc(CACHE_SETS * sizeof(int*));
-    int *bucket_counts = calloc(CACHE_SETS, sizeof(int));
-    for(int i=0; i<CACHE_SETS; i++) {
-        buckets[i] = malloc(BUCKET_SIZE * sizeof(int)); // Safely hold candidates
-    }
+    elem_t **candidates = malloc(MAX_CANDIDATES * sizeof(elem_t*));
+    int num_candidates = 0;
 
     for (size_t i = 0; i < num_elements; i++) {
         uintptr_t addr = (uintptr_t)&buffer_pool[i];
-        int set_idx = (addr >> 6) & SET_MASK; // Shift out 64-byte line, mask the 12 index bits for 4096 sets
-        if (bucket_counts[set_idx] < BUCKET_SIZE) {
-            buckets[set_idx][bucket_counts[set_idx]++] = i;
+        int set_idx = (addr >> 6) & SET_MASK; 
+        
+        if (set_idx == target_set_index) {
+            candidates[num_candidates++] = &buffer_pool[i];
+            if (num_candidates >= MAX_CANDIDATES) break; 
         }
     }
-
-    calibrate_threshold();
-
-    int *es_buffer = malloc(CACHE_WAYS * 10 * sizeof(int)); 
-    int sets_found = 0;
-    time_t start_time = time(NULL);
-
-    printf("[*] Starting per-bucket reduction...\n");
-
-    // Scan through every unique Cache Set Index
-    for (int set_idx = 0; set_idx < CACHE_SETS; set_idx++) {
-        int candidates_available = bucket_counts[set_idx];
-        int *current_bucket = buckets[set_idx];
-
-        // Within this index, try to find sets (representing different slices)
-        while (candidates_available > CACHE_WAYS) {
-            
-            // Pick a victim from the end of the bucket
-            int victim_idx = current_bucket[candidates_available - 1];
-            elem_t *victim = &buffer_pool[victim_idx];
-
-            // Use the rest of the bucket as candidates
-            int batch_size = candidates_available - 1;
-            
-            // REDUCE! Notice how fast this is, batch_size is only ~64 addresses!
-            int es_size = reduce_group(buffer_pool, current_bucket, batch_size, victim, es_buffer);
-
-            if (es_size >= CACHE_WAYS) {
-                sets_found++;
-                if (sets_found % 1000 == 0) {
-                     printf("[+] Found %d sets... (%ld sec)\n", sets_found, time(NULL) - start_time);
-                }
-
-                candidates_available -= (es_size + 1); // remove victim and set
-                break; // NOTE: We break here to just find 1 slice per index. Remove `break` to map ALL slices.
-            } else {
-                break; 
-            }
-        }
-    }
-
-    printf("[*] DONE. Found %d perfectly unique sets in %ld seconds.\n", sets_found, time(NULL) - start_time);
     
+    printf("[*] Calibrating P-Core...\n");
+    // calibrate_threshold();
+
+    elem_t **es_buffer = malloc(MAX_CANDIDATES * sizeof(elem_t*)); 
+    
+    // NEW: Arrays to save our extracted sets and their test victims
+    elem_t *saved_sets[8];
+    elem_t *saved_victims[8];
+    int slices_found = 0;
+    
+    printf("\n[*] Extracting up to 8 slices...\n");
+
+    while (num_candidates > CACHE_WAYS && slices_found < 8) {
+        elem_t *victim = candidates[num_candidates - 1];
+        int es_size = robust_reduce(candidates, num_candidates - 1, victim, es_buffer);
+
+        if (es_size > 0) {
+            elem_t *es_head = build_pointer_list(es_buffer, es_size, -1, 0);
+            
+            // SAVE the set and victim for Phase 2
+            saved_sets[slices_found] = es_head;
+            saved_victims[slices_found] = victim;
+            slices_found++;
+            
+            printf("    [+] Found Slice %d (Size: %d ways)\n", slices_found, es_size);
+
+            elem_t **survivors = malloc(num_candidates * sizeof(elem_t*));
+            int survivors_count = 0;
+
+            for (int i = 0; i < num_candidates; i++) {
+                elem_t *test_candidate = candidates[i];
+                
+                int in_es = 0;
+                for(int j=0; j<es_size; j++) {
+                    if (test_candidate == es_buffer[j]) { in_es = 1; break; }
+                }
+                if (in_es) continue;
+
+                if (tests_eviction(es_head, test_candidate)) continue; 
+                survivors[survivors_count++] = test_candidate;
+            }
+
+            memcpy(candidates, survivors, survivors_count * sizeof(elem_t*));
+            num_candidates = survivors_count;
+            free(survivors);
+        } else {
+            num_candidates--;
+        }
+    }
+
+
+    // --- PHASE 2: E-CORE VERIFICATION ---
+    printf("\n[====== PHASE 2: E-CORE VERIFICATION (Core %d) ======]\n", e_core_id);
+    
+    // Switch process affinity to the E-core
+    pin_cpu(e_core_id);
+    
+    // Give the OS a tiny moment to migrate the thread context before calibrating
+    usleep(1000); 
+
+    printf("[*] Recalibrating for E-Core latencies...\n");
+    // calibrate_threshold();
+    
+    printf("\n[*] Testing P-Core eviction sets on E-Core...\n");
+    for (int i = 0; i < slices_found; i++) {
+        printf("    Testing Slice %d: ", i + 1);
+        benchmark_eviction_rate(saved_sets[i], saved_victims[i]);
+    }
+
+    printf("\n[*] DONE.\n");
+
+    free(candidates);
+    free(es_buffer);
     if (latency_fd != -1) close(latency_fd);
     return 0;
 }
