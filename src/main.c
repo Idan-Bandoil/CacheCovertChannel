@@ -27,6 +27,7 @@
 #define SET_MASK 0xFFF          // Mask for exactly 12 bits (Bits 6-17)
 #define POOL_SIZE_MB 128        // Memory pool size
 #define RETRIES 10               
+#define BUCKET_SIZE 512               
 
 // --- Structures ---
 // EXTREMELY IMPORTANT: Pad the struct to exactly 64 bytes (1 Cache Line)
@@ -39,7 +40,7 @@ typedef struct elem {
 
 // --- Global Variables ---
 elem_t *buffer_pool;
-uint64_t threshold = 150; 
+uint64_t threshold = 120; 
 int latency_fd = -1;
 
 // --- System Tuning Functions ---
@@ -186,11 +187,11 @@ static inline uint64_t rdtsc_end() {
     return ((uint64_t)d << 32) | a;
 }
 
-static inline void maccess(void *p) {
+static inline void maccess(volatile void *p) {
     __asm__ volatile ("movq (%0), %%rax\n" : : "r" (p) : "rax");
 }
 
-static inline uint64_t time_access(void *addr) {
+static inline uint64_t time_access(volatile void *addr) {
     uint64_t start = rdtsc_start();
     maccess(addr);
     uint64_t end = rdtsc_end();
@@ -263,19 +264,39 @@ elem_t* build_list_with_skip(elem_t *base, int *indices, int count, int skip_idx
  * @param   victim          The target memory address to test for eviction.
  * @return  1 if the victim was successfully evicted (latency > threshold), 0 otherwise.
  */
+/**
+ * @name    tests_eviction (Hardened against Prefetchers & RRIP)
+ */
 int tests_eviction(elem_t *candidate_head, elem_t *victim) {
     if (!candidate_head) return 0;
+    
     int successes = 0;
+
     for (int r = 0; r < RETRIES; r++) {
+        // 1. Bring victim into MRU state
         maccess(victim);
         __asm__ volatile("mfence");
+        
+        // 2. Triple Traversal! 
+        // Defeats RRIP by forcing candidate promotion.
+        // On Alder Lake, 2 is good, 3 is bulletproof.
         traverse_list(candidate_head);
-        traverse_list(candidate_head); 
+        traverse_list(candidate_head);
+        traverse_list(candidate_head);
+        
         __asm__ volatile("mfence");
+        
+        // 3. Measure
         uint64_t time = time_access(victim);
-        if (time > threshold) successes++;
+        
+        if (time > threshold) {
+            successes++;
+        }
+        if (successes > RETRIES / 3) return 1;
+        if (r - successes > RETRIES * 2 / 3) return 0;
     }
-    return (successes > RETRIES / 2);
+    
+    return (successes > RETRIES / 3); 
 }
 
 // --- Reduction ---
@@ -296,7 +317,7 @@ int reduce_group(elem_t *base, int *input_indices, int count, elem_t *victim, in
     elem_t *head = build_list_with_skip(base, input_indices, count, -1, 0); 
     if (!tests_eviction(head, victim)) return 0;
 
-    int current_set[1024]; // Max elements in a bucket won't exceed this
+    int current_set[BUCKET_SIZE]; // Max elements in a bucket won't exceed this
     memcpy(current_set, input_indices, count * sizeof(int));
     int current_len = count;
     int chunk_size = current_len / 2;
@@ -330,6 +351,40 @@ cleanup:
         return current_len;
     }
     return 0;
+}
+
+/**
+ * @name    calibrate_threshold
+ * @purpose Measures average L3 hit latency vs Main Memory latency to 
+ * dynamically calculate the perfect eviction threshold.
+ */
+void calibrate_threshold() {
+    volatile elem_t* dummy = &buffer_pool[0];
+    uint64_t hit_total = 0, miss_total = 0;
+    int rounds = 10000;
+
+    for (int i = 0; i < rounds; i++) {
+        // Measure Cache Hit
+        maccess(dummy); // Bring into cache
+        __asm__ volatile("mfence");
+        hit_total += time_access(dummy);
+
+        // Measure Cache Miss (Main Memory)
+        __asm__ volatile("clflush (%0)" : : "r" (dummy) : "memory");
+        __asm__ volatile("mfence");
+        miss_total += time_access(dummy);
+    }
+
+    uint64_t avg_hit = hit_total / rounds;
+    uint64_t avg_miss = miss_total / rounds;
+    
+    // Set threshold exactly in the middle
+    // threshold = (avg_hit + avg_miss) / 2;
+
+    printf("[*] Calibration complete:\n");
+    printf("    -> Avg L3 Hit:   %lu cycles\n", avg_hit);
+    printf("    -> Avg RAM Miss: %lu cycles\n", avg_miss);
+    // printf("    -> Threshold set to: %lu cycles\n\n", threshold);
 }
 
 int main(int argc, char **argv) {
@@ -375,16 +430,18 @@ int main(int argc, char **argv) {
     int **buckets = malloc(CACHE_SETS * sizeof(int*));
     int *bucket_counts = calloc(CACHE_SETS, sizeof(int));
     for(int i=0; i<CACHE_SETS; i++) {
-        buckets[i] = malloc(512 * sizeof(int)); // Safely hold candidates
+        buckets[i] = malloc(BUCKET_SIZE * sizeof(int)); // Safely hold candidates
     }
 
     for (size_t i = 0; i < num_elements; i++) {
         uintptr_t addr = (uintptr_t)&buffer_pool[i];
         int set_idx = (addr >> 6) & SET_MASK; // Shift out 64-byte line, mask the 12 index bits for 4096 sets
-        if (bucket_counts[set_idx] < 512) {
+        if (bucket_counts[set_idx] < BUCKET_SIZE) {
             buckets[set_idx][bucket_counts[set_idx]++] = i;
         }
     }
+
+    calibrate_threshold();
 
     int *es_buffer = malloc(CACHE_WAYS * 10 * sizeof(int)); 
     int sets_found = 0;
@@ -412,7 +469,7 @@ int main(int argc, char **argv) {
 
             if (es_size >= CACHE_WAYS) {
                 sets_found++;
-                if (sets_found % 100 == 0) {
+                if (sets_found % 1000 == 0) {
                      printf("[+] Found %d sets... (%ld sec)\n", sets_found, time(NULL) - start_time);
                 }
 
