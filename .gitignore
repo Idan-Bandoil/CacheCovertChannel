@@ -1,2 +1,4 @@
 *.o
 eviction_builder
+
+*.log

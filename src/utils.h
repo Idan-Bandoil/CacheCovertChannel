@@ -17,8 +17,10 @@
 #define SET_INDEX_SHIFT 6
 #define SET_INDEX_MASK 0xFFF // 12 bits for 4096 sets
 
-// --- Cpu pin ---
+// --- Process management ---
 void pin_cpu(int core_id);
+void set_realtime_priority();
+void set_realtime_latency();
 
 // --- Memory management ---
 void* allocate_huge_pages(size_t num_pages);

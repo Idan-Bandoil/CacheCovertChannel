@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "utils.h"
 #include <stdio.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -120,4 +121,22 @@ void pin_cpu(int core_id) {
     CPU_ZERO(&cpuset);
     CPU_SET(core_id, &cpuset);
     sched_setaffinity(0, sizeof(cpu_set_t), &cpuset);
+}
+
+void set_realtime_priority() {
+    struct sched_param param;
+    param.sched_priority = 99; 
+    sched_setscheduler(0, SCHED_FIFO, &param);
+}
+
+void set_realtime_latency() {
+    int32_t lat = 0; 
+    int latency_fd = open("/dev/cpu_dma_latency", O_RDWR);
+    if (latency_fd != -1){
+        if (sizeof(lat) != write(latency_fd, &lat, sizeof(lat)))
+        {
+            printf("write() failed to write all bytes. errno = %d\n", errno);
+            exit(1);
+        }
+    }
 }
