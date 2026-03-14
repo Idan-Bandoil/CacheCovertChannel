@@ -2,3 +2,5 @@
 eviction_builder
 
 *.log
+
+negative_control

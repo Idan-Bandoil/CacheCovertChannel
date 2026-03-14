@@ -4,28 +4,30 @@ CFLAGS = -Wall -Wextra -O2 -march=native
 SRC_DIR = src
 OBJ_DIR = obj
 
-# List all C files in the src directory and generate corresponding .o files
-SRCS = $(SRC_DIR)/main.c $(SRC_DIR)/utils.c
-OBJS = $(OBJ_DIR)/main.o $(OBJ_DIR)/utils.o
+# Executables
+TARGET1 = eviction_builder
+TARGET2 = negative_control
 
-# The final executable name
-TARGET = eviction_builder
+# Object files
+UTILS_OBJ = $(OBJ_DIR)/utils.o
+MAIN_OBJ = $(OBJ_DIR)/main.o
+NEG_OBJ = $(OBJ_DIR)/negative_control.o
 
-all: $(TARGET)
+all: $(TARGET1) $(TARGET2)
 
-# Link the object files to create the final executable
-$(TARGET): $(OBJS)
+$(TARGET1): $(MAIN_OBJ) $(UTILS_OBJ)
 	$(CC) $(CFLAGS) -o $@ $^
 
-# Compile .c files into .o files inside the obj directory
+$(TARGET2): $(NEG_OBJ) $(UTILS_OBJ)
+	$(CC) $(CFLAGS) -o $@ $^
+
 $(OBJ_DIR)/%.o: $(SRC_DIR)/%.c | $(OBJ_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-# Create the object directory if it doesn't exist
 $(OBJ_DIR):
 	mkdir -p $(OBJ_DIR)
 
 clean:
-	rm -rf $(OBJ_DIR) $(TARGET)
+	rm -rf $(OBJ_DIR) $(TARGET1) $(TARGET2)
 
 .PHONY: all clean

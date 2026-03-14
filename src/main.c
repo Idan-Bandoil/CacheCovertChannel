@@ -5,10 +5,22 @@
 
 // --- Run Configuration ---
 #define NUM_HUGE_PAGES 100
-#define TARGET_SLICE 2
+#define TARGET_SLICE 6
 #define TARGET_SET 0x5A
-#define CACHE_MISS_THRESHOLD 150 
-#define CACHE_HIT_THRESHOLD 100
+
+// --- Precise Range Configuration ---
+// Hits should be fast L1/L2/L3 accesses
+#define HIT_MIN_CYCLES 0
+#define HIT_MAX_CYCLES 110
+
+// Misses should be true DRAM fetches, but not absurdly high
+#define MISS_MIN_CYCLES HIT_MAX_CYCLES
+#define MISS_MAX_CYCLES 800
+
+// Anything above this is considered system noise (OS interrupt, TLB miss, etc.)
+// and will be excluded from the mean calculations.
+#define OUTLIER_THRESHOLD MISS_MAX_CYCLES 
+
 #define EVICTION_SET_SIZE (LLC_WAYS * 3) 
 
 // --- Testing Configuration ---
@@ -71,10 +83,17 @@ search_done:
     void *victim = candidate_set[EVICTION_SET_SIZE]; 
     void **eviction_set = candidate_set; 
 
-    int valid_hits = 0;
-    int valid_misses = 0;
+    // Statistics tracking variables
+    int target_hits = 0;
+    int target_misses = 0;
+    int hit_outliers = 0;
+    int miss_outliers = 0;
+    
     uint64_t sum_hit_time = 0;
     uint64_t sum_miss_time = 0;
+    
+    int valid_hit_measurements = 0;
+    int valid_miss_measurements = 0;
 
     for (int iter = 0; iter < TEST_ITERATIONS; iter++) {
         // Step A: Bring victim into cache and measure baseline
@@ -94,30 +113,56 @@ search_done:
         WARM_TLB(victim);
         uint64_t miss_time = measure_access_time(victim);
 
-        // Record Statistics
-        sum_hit_time += hit_time;
-        sum_miss_time += miss_time;
-        if (hit_time <= CACHE_HIT_THRESHOLD) valid_hits++;
-        if (miss_time >= CACHE_MISS_THRESHOLD) valid_misses++;
+        // Record Statistics for Hit Time
+        if (hit_time > OUTLIER_THRESHOLD) {
+            hit_outliers++;
+        } else {
+            sum_hit_time += hit_time;
+            valid_hit_measurements++;
+            if (hit_time <= HIT_MAX_CYCLES) {
+                target_hits++;
+            }
+        }
+
+        // Record Statistics for Miss Time
+        if (miss_time > OUTLIER_THRESHOLD) {
+            miss_outliers++;
+        } else {
+            sum_miss_time += miss_time;
+            valid_miss_measurements++;
+            if (miss_time >= MISS_MIN_CYCLES && miss_time <= MISS_MAX_CYCLES) {
+                target_misses++;
+            }
+        }
     }
 
     // 3. Print Final Statistics
-    double hit_pct = ((double)valid_hits / TEST_ITERATIONS) * 100.0;
-    double miss_pct = ((double)valid_misses / TEST_ITERATIONS) * 100.0;
+    // Calculate percentages strictly out of non-outlier measurements
+    double hit_pct = valid_hit_measurements > 0 ? 
+                     ((double)target_hits / valid_hit_measurements) * 100.0 : 0.0;
+    double miss_pct = valid_miss_measurements > 0 ? 
+                      ((double)target_misses / valid_miss_measurements) * 100.0 : 0.0;
+                      
+    double mean_hit = valid_hit_measurements > 0 ? 
+                      (double)sum_hit_time / valid_hit_measurements : 0.0;
+    double mean_miss = valid_miss_measurements > 0 ? 
+                       (double)sum_miss_time / valid_miss_measurements : 0.0;
 
-    printf("\n=========================================\n");
-    printf("             TEST STATISTICS             \n");
-    printf("=========================================\n");
-    printf("Total Iterations:        %d\n", TEST_ITERATIONS);
-    printf("-----------------------------------------\n");
-    printf("Baseline Hit Times (Target: <= %d)\n", CACHE_HIT_THRESHOLD);
-    printf("  Mean Time:             %.2f cycles\n", (double)sum_hit_time / TEST_ITERATIONS);
-    printf("  Within Threshold:      %d / %d (%.2f%%)\n", valid_hits, TEST_ITERATIONS, hit_pct);
-    printf("-----------------------------------------\n");
-    printf("Post-Eviction Times (Target: >= %d)\n", CACHE_MISS_THRESHOLD);
-    printf("  Mean Time:             %.2f cycles\n", (double)sum_miss_time / TEST_ITERATIONS);
-    printf("  Within Threshold:      %d / %d (%.2f%%)\n", valid_misses, TEST_ITERATIONS, miss_pct);
-    printf("=========================================\n");
+    printf("\n=======================================================\n");
+    printf("                  TEST STATISTICS                      \n");
+    printf("=======================================================\n");
+    printf("Total Iterations Executed: %d\n", TEST_ITERATIONS);
+    printf("-------------------------------------------------------\n");
+    printf("Baseline Hit Times (Target Range: %d - %d cycles)\n", HIT_MIN_CYCLES, HIT_MAX_CYCLES);
+    printf("  Mean Time (sans outliers): %.2f cycles\n", mean_hit);
+    printf("  Within Target Range:       %d / %d (%.2f%%)\n", target_hits, valid_hit_measurements, hit_pct);
+    printf("  Outliers Ignored (>%d):  %d\n", OUTLIER_THRESHOLD, hit_outliers);
+    printf("-------------------------------------------------------\n");
+    printf("Post-Eviction Times (Target Range: %d - %d cycles)\n", MISS_MIN_CYCLES, MISS_MAX_CYCLES);
+    printf("  Mean Time (sans outliers): %.2f cycles\n", mean_miss);
+    printf("  Within Target Range:       %d / %d (%.2f%%)\n", target_misses, valid_miss_measurements, miss_pct);
+    printf("  Outliers Ignored (>%d):  %d\n", OUTLIER_THRESHOLD, miss_outliers);
+    printf("=======================================================\n");
 
     return 0;
 }
