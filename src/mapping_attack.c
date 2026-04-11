@@ -5,9 +5,9 @@
 #include "utils.h"
 
 #define NUM_PAGES 100
-#define BOOTSTRAP_SET 0x0
+#define BOOTSTRAP_SET 0x5A
 #define TARGET_EVICTION_COUNT (LLC_WAYS * 2) 
-#define MISS_THRESHOLD 110
+#define MISS_THRESHOLD 150
 
 // Macro for TLB warmup
 #define WARM_TLB(addr) do { \
@@ -36,13 +36,24 @@ bool test_group(void *victim, void **group, int size) {
         for (int i = size - 1; i >= 0; i--) maccess(group[i]);
     }
 
+    WARM_TLB(victim);
     return measure_access_time(victim) >= MISS_THRESHOLD;
+}
+
+bool test_group_robust(void *victim, void **group, int size) {
+    int misses = 0;
+    int tests = 5; 
+    for(int t = 0; t < tests; t++) {
+        if (test_group(victim, group, size)) misses++;
+    }
+    // Return true only if it consistently evicts (majority vote)
+    return misses >= 3; 
 }
 
 // Phase 1: Robust Pruning Algorithm
 bool find_eviction_set(void *victim, void **pool, int pool_size, void **eviction_set_out, int *out_size) {
     // 1. Verify the whole pool works as a baseline
-    if (!test_group(victim, pool, pool_size)) {
+    if (!test_group_robust(victim, pool, pool_size)) {
         return false; 
     }
 
@@ -59,7 +70,7 @@ bool find_eviction_set(void *victim, void **pool, int pool_size, void **eviction
         for (int j = i; j < w_size - 1; j++) working_set[j] = working_set[j + 1];
         w_size--;
 
-        if (test_group(victim, working_set, w_size)) {
+        if (test_group_robust(victim, working_set, w_size)) {
             // Still evicts! The candidate is unnecessary. Permanently discard.
             // Do NOT increment i, because a new element shifted into index i.
             if (w_size <= TARGET_EVICTION_COUNT) break; // Reached our target optimized size
@@ -105,48 +116,102 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    printf("[*] Phase 1: Bootstrapping one eviction set from %d candidates...\n", pool_ptr);
+    printf("[*] Phase 1 & 2: Iterative Bootstrapping and Alignment...\n");
     
-    // We isolate one line as the victim, and use the rest as the pool
-    void *victim = candidate_pool[0];
-    void *eviction_set[total_candidates];
-    int ev_size = 0;
-    
-    if (!find_eviction_set(victim, &candidate_pool[1], pool_ptr - 1, eviction_set, &ev_size)) {
-        printf("[-] Failed to find initial eviction set. The pool itself does not evict the victim.\n");
-        return 1;
-    }
-    printf("[+] Found working bootstrap eviction set of %d lines!\n", ev_size);
-
-    // Phase 2: Algebraic Page Alignment
     int delta[NUM_PAGES];
     bool page_mapped[NUM_PAGES];
     for (int i = 0; i < NUM_PAGES; i++) page_mapped[i] = false;
+    
+    int mapped_count = 0;
+    int victim_index = 0;
 
-    // Use the victim's page (Page 0) as our reference point
-    int ref_hash = get_known_hash(victim);
-    delta[0] = 0;
-    page_mapped[0] = true;
+    // Seed random for the shuffler
+    srand(1337); 
 
-    printf("[*] Phase 2: Aligning pages via XOR Delta logic...\n");
-    for (int i = 0; i < ev_size; i++) {
-        int p = ((uintptr_t)eviction_set[i] - (uintptr_t)pages) / HUGE_PAGE_SIZE;
-        if (!page_mapped[p]) {
-            // Delta_p = Hash_Known(Victim) ^ Hash_Known(Current_Eviction_Line)
-            delta[p] = ref_hash ^ get_known_hash(eviction_set[i]);
-            page_mapped[p] = true;
+    // Keep trying new victims until all pages are mapped
+    while (mapped_count < NUM_PAGES && victim_index < total_candidates) {
+        void *victim = candidate_pool[victim_index];
+        int victim_page = ((uintptr_t)victim - (uintptr_t)pages) / HUGE_PAGE_SIZE;
+        
+        // If the victim's page is already mapped, and we aren't on the very first run, skip it
+        // to force the algorithm to explore different physical slices.
+        if (mapped_count > 0 && page_mapped[victim_page]) {
+            victim_index++;
+            continue;
         }
+
+        // Build a pool of candidates EXCLUDING the current victim
+        void *current_pool[total_candidates];
+        int current_pool_size = 0;
+        for (int i = 0; i < total_candidates; i++) {
+            if (candidate_pool[i] != victim) {
+                current_pool[current_pool_size++] = candidate_pool[i];
+            }
+        }
+
+        // SHUFFLE the pool to prevent the top-down linear bias
+        for (int i = current_pool_size - 1; i > 0; i--) {
+            int j = rand() % (i + 1);
+            void *temp = current_pool[i];
+            current_pool[i] = current_pool[j];
+            current_pool[j] = temp;
+        }
+
+        void *eviction_set[total_candidates];
+        int ev_size = 0;
+        
+        printf("[*] Testing Victim %d (Page %d)... ", victim_index, victim_page);
+        
+        if (find_eviction_set(victim, current_pool, current_pool_size, eviction_set, &ev_size)) {
+            printf("Found minimal set of %d lines!\n", ev_size);
+            
+            // If this is the absolute first success, anchor Page 0 to Delta 0
+            if (mapped_count == 0) {
+                delta[0] = 0;
+                page_mapped[0] = true;
+                mapped_count = 1;
+            }
+
+            // We need a known reference point to calculate deltas.
+            // Find a line in this eviction set that belongs to an ALREADY MAPPED page.
+            int ref_hash = -1;
+            for (int i = 0; i < ev_size; i++) {
+                int p = ((uintptr_t)eviction_set[i] - (uintptr_t)pages) / HUGE_PAGE_SIZE;
+                if (page_mapped[p]) {
+                    // We found a bridge! The actual physical slice of this eviction set 
+                    // is represented by: Hash_Known(Bridge_Line) ^ Delta[p]
+                    ref_hash = get_known_hash(eviction_set[i]) ^ delta[p];
+                    break;
+                }
+            }
+
+            // If we found a bridge to our existing mapped pages, calculate the new deltas
+            if (ref_hash != -1) {
+                for (int i = 0; i < ev_size; i++) {
+                    int p = ((uintptr_t)eviction_set[i] - (uintptr_t)pages) / HUGE_PAGE_SIZE;
+                    if (!page_mapped[p]) {
+                        delta[p] = ref_hash ^ get_known_hash(eviction_set[i]);
+                        page_mapped[p] = true;
+                        mapped_count++;
+                    }
+                }
+            } else {
+                printf("    [!] Valid set, but no bridge to previously mapped pages. Skipping.\n");
+            }
+        } else {
+            printf("Failed to find set.\n");
+        }
+        
+        victim_index++;
     }
 
     // Print Results
     printf("\n=========================================\n");
     printf("        ALGEBRAIC PAGE ALIGNMENT         \n");
     printf("=========================================\n");
-    int mapped_count = 0;
     for (int i = 0; i < NUM_PAGES; i++) {
         if (page_mapped[i]) {
             printf("Page %02d: Relative Slice Offset (Delta) = %d\n", i, delta[i]);
-            mapped_count++;
         }
     }
     printf("-----------------------------------------\n");
