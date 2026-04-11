@@ -8,6 +8,32 @@
 #define BOOTSTRAP_SET 0x5A
 #define TARGET_EVICTION_COUNT (LLC_WAYS * 2) 
 #define MISS_THRESHOLD 150
+#define L2_WASH_LINES 40000 // 40,000 lines * 64 bytes = ~2.5MB (flushes 1.25MB L2 easily)
+
+void *l2_wash_pool[L2_WASH_LINES];
+
+// Initialize the L2 Wash Buffer
+void init_l2_wash() {
+    // Allocate 2 huge pages (4MB) just for wash data
+    uint8_t *wash_memory = (uint8_t*)allocate_huge_pages(2);
+    int ptr = 0;
+    
+    for (uint64_t off = 0; off < 2 * HUGE_PAGE_SIZE && ptr < L2_WASH_LINES; off += CACHE_LINE_SIZE) {
+        int set = (off >> SET_INDEX_SHIFT) & SET_INDEX_MASK;
+        // CRITICAL: We dodge our target L3 set! 
+        if (set != BOOTSTRAP_SET) {
+            l2_wash_pool[ptr++] = wash_memory + off;
+        }
+    }
+    printf("[+] Initialized L2 Wash Buffer with %d set-dodging lines.\n", ptr);
+}
+
+// Function to push everything out of L2 and down into L3
+void wash_l2() {
+    for (int i = 0; i < L2_WASH_LINES; i++) {
+        maccess(l2_wash_pool[i]);
+    }
+}
 
 // Macro for TLB warmup
 #define WARM_TLB(addr) do { \
@@ -25,15 +51,20 @@ int get_known_hash(void *vaddr) {
 
 // Helper: Tests if a group of addresses successfully evicts the victim
 bool test_group(void *victim, void **group, int size) {
-    // Ensure firmly cached
-    maccess(victim);
+    // 1. Ensure firmly cached in L1/L2
     maccess(victim);
     maccess(victim);
 
-    // Thrash the set to overwhelm RRIP
+    // 2. Wash L2 to push the victim down to the L3
+    wash_l2();
+
+    // 3. Thrash the set
     for (int sweep = 0; sweep < 3; sweep++) {
+        // Bring candidates into L1/L2
         for (int i = 0; i < size; i++) maccess(group[i]);
-        for (int i = size - 1; i >= 0; i--) maccess(group[i]);
+        
+        // Push candidates down to L3 so they conflict with the victim!
+        wash_l2();
     }
 
     WARM_TLB(victim);
@@ -100,6 +131,8 @@ int main(int argc, char *argv[]) {
     set_realtime_latency();
 
     uint8_t *pages = (uint8_t*)allocate_huge_pages(NUM_PAGES);
+
+    init_l2_wash();
     
     // Efficient Candidate Construction (Direct Bitwise Mapping)
     int total_candidates = NUM_PAGES * 8;
