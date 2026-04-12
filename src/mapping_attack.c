@@ -172,9 +172,6 @@ int main(int argc, char *argv[]) {
     int mapped_count = 0;
     int victim_index = 0;
 
-    // Seed random for the shuffler
-    srand(1337); 
-
     // Keep trying new victims until all pages are mapped
     while (mapped_count < NUM_PAGES && victim_index < total_candidates) {
         uint8_t *victim = candidate_pool[victim_index];
@@ -196,13 +193,7 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        // SHUFFLE the pool to prevent the top-down linear bias
-        for (int i = current_pool_size - 1; i > 0; i--) {
-            int j = rand() % (i + 1);
-            uint8_t *temp = current_pool[i];
-            current_pool[i] = current_pool[j];
-            current_pool[j] = temp;
-        }
+        shuffle_buffer_randomly(current_pool, current_pool_size);
 
         uint8_t *eviction_set[total_candidates];
         int ev_size = 0;

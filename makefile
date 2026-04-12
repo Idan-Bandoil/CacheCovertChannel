@@ -1,5 +1,5 @@
 CC = gcc
-CFLAGS = -Wall -Wextra -O2 -march=native
+CFLAGS = -Wall -Wextra -O2 -march=native -std=c11 -pedantic
 
 SRC_DIR = src
 OBJ_DIR = obj

@@ -6,6 +6,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sched.h>
+#include <stdbool.h>
 #include <sys/mman.h>
 #include <x86intrin.h>
 
@@ -34,6 +35,25 @@ int get_cache_slice(uint64_t phys_addr) {
                GET_BIT(phys_addr, 30) ^ GET_BIT(phys_addr, 31) ^ GET_BIT(phys_addr, 33);
 
     return (bit2 << 2) | (bit1 << 1) | bit0;
+}
+
+void shuffle_buffer_randomly(uint8_t* buffer, int buffer_size)
+{
+    static bool seeded = false;
+
+    if (!seeded)
+    {
+        srand(1337);
+        seeded = true;
+    }
+
+    for (int i = buffer_size - 1; i > 0; i--) 
+    {
+        int j = rand() % (i + 1);
+        uint8_t *temp = buffer[i];
+        buffer[i] = buffer[j];
+        buffer[j] = temp;
+    }
 }
 
 void* allocate_huge_pages(size_t num_pages) {

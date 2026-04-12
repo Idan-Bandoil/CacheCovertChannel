@@ -33,4 +33,6 @@ void maccess(volatile void *addr);
 // --- Cache Mapping ---
 int get_cache_slice(uint64_t phys_addr);
 
+void shuffle_buffer_randomly(uint8_t* buffer, int buffer_size);
+
 #endif // UTILS_H
