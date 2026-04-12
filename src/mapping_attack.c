@@ -120,6 +120,27 @@ bool find_eviction_set(void *victim, void **pool, int pool_size, void **eviction
     return w_size >= LLC_WAYS;
 }
 
+int create_candidate_pool(int set_idx, int required_candidates, uint8_t* huge_pages_base, 
+    void*** candidate_pool_out)
+{
+    void **candidate_pool = malloc(sizeof(void*) * required_candidates);
+    int pool_index = 0;
+
+    for (int p = 0; (p < NUM_PAGES) && (pool_index < required_candidates); p++) {
+        uint8_t *page_base = huge_pages_base + (p * HUGE_PAGE_SIZE);
+        
+        // Loop through the 8 combinations of bits 18, 19, 20
+        for (uint64_t variation = 0; variation < 8; variation++) {
+            uint64_t offset = (variation << 18) | (set_idx << SET_INDEX_SHIFT);
+            candidate_pool[pool_index++] = page_base + offset;
+        }
+    }
+
+    *candidate_pool_out = candidate_pool;
+
+    return (pool_index < required_candidates) ? 0 : 1;
+}
+
 int main(int argc, char *argv[]) {
     if (argc < 2) {
         printf("Usage: %s <core_id>\n", argv[0]);
@@ -134,19 +155,12 @@ int main(int argc, char *argv[]) {
 
     init_l2_wash();
     
-    // Efficient Candidate Construction (Direct Bitwise Mapping)
     int total_candidates = NUM_PAGES * 8;
     void **candidate_pool = malloc(sizeof(void*) * total_candidates);
-    int pool_ptr = 0;
-
-    for (int p = 0; p < NUM_PAGES; p++) {
-        uint8_t *page_base = pages + (p * HUGE_PAGE_SIZE);
-        
-        // Loop through the 8 combinations of bits 18, 19, 20
-        for (uint64_t variation = 0; variation < 8; variation++) {
-            uint64_t offset = (variation << 18) | (BOOTSTRAP_SET << SET_INDEX_SHIFT);
-            candidate_pool[pool_ptr++] = page_base + offset;
-        }
+    if (!create_candidate_pool(BOOTSTRAP_SET, total_candidates, pages, &candidate_pool))
+    {
+        printf("create_candidate_pool() failed to find enough candidates!\n");
+        return 1;
     }
 
     printf("[*] Phase 1 & 2: Iterative Bootstrapping and Alignment...\n");
