@@ -50,7 +50,7 @@ int get_known_hash(void *vaddr) {
 }
 
 // Helper: Tests if a group of addresses successfully evicts the victim
-bool test_group(void *victim, void **group, int size) {
+bool test_group(uint8_t *victim, uint8_t **group, int size) {
     // 1. Ensure firmly cached in L1/L2
     maccess(victim);
     maccess(victim);
@@ -71,7 +71,7 @@ bool test_group(void *victim, void **group, int size) {
     return measure_access_time(victim) >= MISS_THRESHOLD;
 }
 
-bool test_group_robust(void *victim, void **group, int size) {
+bool test_group_robust(uint8_t *victim, uint8_t **group, int size) {
     int misses = 0;
     int tests = 5; 
     for(int t = 0; t < tests; t++) {
@@ -82,20 +82,20 @@ bool test_group_robust(void *victim, void **group, int size) {
 }
 
 // Phase 1: Robust Pruning Algorithm
-bool find_eviction_set(void *victim, void **pool, int pool_size, void **eviction_set_out, int *out_size) {
+bool find_eviction_set(uint8_t *victim, uint8_t **pool, int pool_size, uint8_t **eviction_set_out, int *out_size) {
     // 1. Verify the whole pool works as a baseline
     if (!test_group_robust(victim, pool, pool_size)) {
         return false; 
     }
 
     // 2. Setup a working array we can shrink
-    void *working_set[pool_size];
+    uint8_t *working_set[pool_size];
     for (int i = 0; i < pool_size; i++) working_set[i] = pool[i];
     int w_size = pool_size;
 
     // 3. Prune elements one by one
     for (int i = 0; i < w_size; ) {
-        void *candidate = working_set[i];
+        uint8_t *candidate = working_set[i];
         
         // Temporarily remove candidate by shifting left
         for (int j = i; j < w_size - 1; j++) working_set[j] = working_set[j + 1];
@@ -121,9 +121,9 @@ bool find_eviction_set(void *victim, void **pool, int pool_size, void **eviction
 }
 
 int create_candidate_pool(int set_idx, int required_candidates, uint8_t* huge_pages_base, 
-    void*** candidate_pool_out)
+    uint8_t*** candidate_pool_out)
 {
-    void **candidate_pool = malloc(sizeof(void*) * required_candidates);
+    uint8_t **candidate_pool = malloc(sizeof(uint8_t*) * required_candidates);
     int pool_index = 0;
 
     for (int p = 0; (p < NUM_PAGES) && (pool_index < required_candidates); p++) {
@@ -156,7 +156,7 @@ int main(int argc, char *argv[]) {
     init_l2_wash();
     
     int total_candidates = NUM_PAGES * 8;
-    void **candidate_pool = malloc(sizeof(void*) * total_candidates);
+    uint8_t **candidate_pool = malloc(sizeof(uint8_t*) * total_candidates);
     if (!create_candidate_pool(BOOTSTRAP_SET, total_candidates, pages, &candidate_pool))
     {
         printf("create_candidate_pool() failed to find enough candidates!\n");
@@ -177,7 +177,7 @@ int main(int argc, char *argv[]) {
 
     // Keep trying new victims until all pages are mapped
     while (mapped_count < NUM_PAGES && victim_index < total_candidates) {
-        void *victim = candidate_pool[victim_index];
+        uint8_t *victim = candidate_pool[victim_index];
         int victim_page = ((uintptr_t)victim - (uintptr_t)pages) / HUGE_PAGE_SIZE;
         
         // If the victim's page is already mapped, and we aren't on the very first run, skip it
@@ -188,7 +188,7 @@ int main(int argc, char *argv[]) {
         }
 
         // Build a pool of candidates EXCLUDING the current victim
-        void *current_pool[total_candidates];
+        uint8_t *current_pool[total_candidates];
         int current_pool_size = 0;
         for (int i = 0; i < total_candidates; i++) {
             if (candidate_pool[i] != victim) {
@@ -199,12 +199,12 @@ int main(int argc, char *argv[]) {
         // SHUFFLE the pool to prevent the top-down linear bias
         for (int i = current_pool_size - 1; i > 0; i--) {
             int j = rand() % (i + 1);
-            void *temp = current_pool[i];
+            uint8_t *temp = current_pool[i];
             current_pool[i] = current_pool[j];
             current_pool[j] = temp;
         }
 
-        void *eviction_set[total_candidates];
+        uint8_t *eviction_set[total_candidates];
         int ev_size = 0;
         
         printf("[*] Testing Victim %d (Page %d)... ", victim_index, victim_page);
