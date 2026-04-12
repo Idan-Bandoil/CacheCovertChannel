@@ -229,6 +229,21 @@ int bootstrap_page_alignment(uint8_t **candidate_pool, int total_candidates, uin
     return mapped_count;
 }
 
+void print_page_alignments(bool* page_mapped, int* delta, int mapped_count)
+{
+    printf("\n=========================================\n");
+    printf("        ALGEBRAIC PAGE ALIGNMENT         \n");
+    printf("=========================================\n");
+    for (int i = 0; i < NUM_PAGES; i++) {
+        if (page_mapped[i]) {
+            printf("Page %02d: Relative Slice Offset (Delta) = %d\n", i, delta[i]);
+        }
+    }
+    printf("-----------------------------------------\n");
+    printf("Successfully aligned %d/%d pages.\n", mapped_count, NUM_PAGES);
+    printf("=========================================\n");
+}
+
 int main(int argc, char *argv[]) {
     if (argc < 2) {
         printf("Usage: %s <core_id>\n", argv[0]);
@@ -257,18 +272,59 @@ int main(int argc, char *argv[]) {
     
     int mapped_count = bootstrap_page_alignment(candidate_pool, total_candidates, pages, page_mapped, delta);
 
-    // Print Results
-    printf("\n=========================================\n");
-    printf("        ALGEBRAIC PAGE ALIGNMENT         \n");
-    printf("=========================================\n");
-    for (int i = 0; i < NUM_PAGES; i++) {
-        if (page_mapped[i]) {
-            printf("Page %02d: Relative Slice Offset (Delta) = %d\n", i, delta[i]);
+    print_page_alignments(page_mapped, delta, mapped_count);
+
+    // =========================================
+    // PHASE 3: O(1) MATHEMATICAL BUCKETING
+    // =========================================
+    printf("[*] Phase 3: Instantly generating a perfect eviction set via math...\n");
+
+    int target_set = 0x7;   // Pick ANY set (0 to 4095)
+    int target_slice = 7;     // Pick ANY slice (0 to 7)
+    
+    uint8_t *perfect_eviction_set[TARGET_EVICTION_COUNT];
+    int found_perfect = 0;
+
+    // Scan through our aligned pages
+    for (int p = 0; p < NUM_PAGES && found_perfect < TARGET_EVICTION_COUNT; p++) {
+        uint8_t *page_base = pages + (p * HUGE_PAGE_SIZE);
+        
+        // Check all 8 lines in this page that map to the target_set
+        for (uint64_t variation = 0; variation < 8; variation++) {
+            uint64_t offset = (variation << 18) | (target_set << SET_INDEX_SHIFT);
+            void *candidate = page_base + offset;
+            
+            // Calculate the true physical slice using our recovered Delta!
+            int relative_slice = get_known_hash(candidate) ^ delta[p];
+            
+            if (relative_slice == target_slice) {
+                perfect_eviction_set[found_perfect++] = candidate;
+                
+                // Break out of the variation loop!
+                // We only want ONE line per huge page to prevent L2 cache clustering
+                break; 
+            }
         }
     }
-    printf("-----------------------------------------\n");
-    printf("Successfully aligned %d/%d pages.\n", mapped_count, NUM_PAGES);
-    printf("=========================================\n");
+
+    if (found_perfect == TARGET_EVICTION_COUNT) {
+        printf("[+] Successfully generated %d lines for Set 0x%03X, Slice %d!\n", 
+               found_perfect, target_set, target_slice);
+               
+        // Let's prove it works! We test if these mathematically chosen lines 
+        // can evict each other. We use the first line as a victim.
+        void *test_victim = perfect_eviction_set[0];
+        
+        // We use the remaining 23 lines as the thrashing group
+        if (test_group_robust(test_victim, &perfect_eviction_set[1], found_perfect - 1)) {
+            printf("[+] VERIFIED: The mathematical eviction set triggers L3 misses!\n");
+        } else {
+            printf("[-] The set was mathematically generated, but hardware absorbed the thrash.\n");
+        }
+    } else {
+        printf("[-] Could not find enough lines. (Found %d, need %d). Allocate more NUM_PAGES.\n", 
+               found_perfect, TARGET_EVICTION_COUNT);
+    }
 
     free(candidate_pool);
     return 0;
