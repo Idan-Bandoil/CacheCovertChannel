@@ -141,34 +141,39 @@ int create_candidate_pool(int set_idx, int required_candidates, uint8_t* huge_pa
     return (pool_index < required_candidates) ? 0 : 1;
 }
 
-int main(int argc, char *argv[]) {
-    if (argc < 2) {
-        printf("Usage: %s <core_id>\n", argv[0]);
-        return 1;
-    }
-    int core_id = atoi(argv[1]);
-    pin_cpu(core_id);
-    set_realtime_priority();
-    set_realtime_latency();
+// Helper: Finds a bridge to an already mapped page and calculates Deltas for new pages
+bool calculate_page_deltas(uint8_t **eviction_set, int ev_size, uint8_t *pages, bool *page_mapped, int *delta, int *mapped_count) {
+    int ref_hash = -1;
 
-    uint8_t *pages = (uint8_t*)allocate_huge_pages(NUM_PAGES);
-
-    init_l2_wash();
-    
-    int total_candidates = NUM_PAGES * 8;
-    uint8_t **candidate_pool = malloc(sizeof(uint8_t*) * total_candidates);
-    if (!create_candidate_pool(BOOTSTRAP_SET, total_candidates, pages, &candidate_pool))
-    {
-        printf("create_candidate_pool() failed to find enough candidates!\n");
-        return 1;
+    // 1. Find a line in this eviction set that belongs to an ALREADY MAPPED page.
+    for (int i = 0; i < ev_size; i++) {
+        int p = ((uintptr_t)eviction_set[i] - (uintptr_t)pages) / HUGE_PAGE_SIZE;
+        if (page_mapped[p]) {
+            // We found a bridge! The actual physical slice of this eviction set 
+            // is represented by: Hash_Known(Bridge_Line) ^ Delta[p]
+            ref_hash = get_known_hash(eviction_set[i]) ^ delta[p];
+            break;
+        }
     }
 
-    printf("[*] Phase 1 & 2: Iterative Bootstrapping and Alignment...\n");
-    
-    int delta[NUM_PAGES];
-    bool page_mapped[NUM_PAGES];
-    for (int i = 0; i < NUM_PAGES; i++) page_mapped[i] = false;
-    
+    // 2. If we found a bridge to our existing mapped pages, calculate the new deltas
+    if (ref_hash != -1) {
+        for (int i = 0; i < ev_size; i++) {
+            int p = ((uintptr_t)eviction_set[i] - (uintptr_t)pages) / HUGE_PAGE_SIZE;
+            if (!page_mapped[p]) {
+                delta[p] = ref_hash ^ get_known_hash(eviction_set[i]);
+                page_mapped[p] = true;
+                (*mapped_count)++; // Increment the tracked count via pointer
+            }
+        }
+        return true; 
+    }
+
+    return false; // No bridge to previously mapped pages
+}
+
+// Phase 1 & 2: Iterative Bootstrapping and Algebraic Alignment
+int bootstrap_page_alignment(uint8_t **candidate_pool, int total_candidates, uint8_t *pages, bool *page_mapped, int *delta) {
     int mapped_count = 0;
     int victim_index = 0;
 
@@ -193,7 +198,7 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        shuffle_buffer_randomly(current_pool, current_pool_size);
+        shuffle_addresses_randomly(current_pool, current_pool_size);
 
         uint8_t *eviction_set[total_candidates];
         int ev_size = 0;
@@ -210,30 +215,8 @@ int main(int argc, char *argv[]) {
                 mapped_count = 1;
             }
 
-            // We need a known reference point to calculate deltas.
-            // Find a line in this eviction set that belongs to an ALREADY MAPPED page.
-            int ref_hash = -1;
-            for (int i = 0; i < ev_size; i++) {
-                int p = ((uintptr_t)eviction_set[i] - (uintptr_t)pages) / HUGE_PAGE_SIZE;
-                if (page_mapped[p]) {
-                    // We found a bridge! The actual physical slice of this eviction set 
-                    // is represented by: Hash_Known(Bridge_Line) ^ Delta[p]
-                    ref_hash = get_known_hash(eviction_set[i]) ^ delta[p];
-                    break;
-                }
-            }
-
-            // If we found a bridge to our existing mapped pages, calculate the new deltas
-            if (ref_hash != -1) {
-                for (int i = 0; i < ev_size; i++) {
-                    int p = ((uintptr_t)eviction_set[i] - (uintptr_t)pages) / HUGE_PAGE_SIZE;
-                    if (!page_mapped[p]) {
-                        delta[p] = ref_hash ^ get_known_hash(eviction_set[i]);
-                        page_mapped[p] = true;
-                        mapped_count++;
-                    }
-                }
-            } else {
+            // Attempt to bridge and calculate new deltas
+            if (!calculate_page_deltas(eviction_set, ev_size, pages, page_mapped, delta, &mapped_count)) {
                 printf("    [!] Valid set, but no bridge to previously mapped pages. Skipping.\n");
             }
         } else {
@@ -242,6 +225,37 @@ int main(int argc, char *argv[]) {
         
         victim_index++;
     }
+
+    return mapped_count;
+}
+
+int main(int argc, char *argv[]) {
+    if (argc < 2) {
+        printf("Usage: %s <core_id>\n", argv[0]);
+        return 1;
+    }
+    int core_id = atoi(argv[1]);
+    pin_cpu(core_id);
+    set_realtime_priority();
+    set_realtime_latency();
+
+    uint8_t *pages = (uint8_t*)allocate_huge_pages(NUM_PAGES);
+
+    init_l2_wash();
+    
+    int total_candidates = NUM_PAGES * 8;
+    uint8_t **candidate_pool = malloc(sizeof(uint8_t*) * total_candidates);
+    if (!create_candidate_pool(BOOTSTRAP_SET, total_candidates, pages, &candidate_pool))
+    {
+        printf("create_candidate_pool() failed to find enough candidates!\n");
+        return 1;
+    }
+    
+    int delta[NUM_PAGES];
+    bool page_mapped[NUM_PAGES];
+    for (int i = 0; i < NUM_PAGES; i++) page_mapped[i] = false;
+    
+    int mapped_count = bootstrap_page_alignment(candidate_pool, total_candidates, pages, page_mapped, delta);
 
     // Print Results
     printf("\n=========================================\n");

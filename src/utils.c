@@ -37,7 +37,7 @@ int get_cache_slice(uint64_t phys_addr) {
     return (bit2 << 2) | (bit1 << 1) | bit0;
 }
 
-void shuffle_buffer_randomly(uint8_t* buffer, int buffer_size)
+void shuffle_addresses_randomly(uint8_t** addresses, int addresses_count)
 {
     static bool seeded = false;
 
@@ -47,12 +47,12 @@ void shuffle_buffer_randomly(uint8_t* buffer, int buffer_size)
         seeded = true;
     }
 
-    for (int i = buffer_size - 1; i > 0; i--) 
+    for (int i = addresses_count - 1; i > 0; i--) 
     {
         int j = rand() % (i + 1);
-        uint8_t *temp = buffer[i];
-        buffer[i] = buffer[j];
-        buffer[j] = temp;
+        uint8_t *temp = addresses[i];
+        addresses[i] = addresses[j];
+        addresses[j] = temp;
     }
 }
 
