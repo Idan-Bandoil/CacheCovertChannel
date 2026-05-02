@@ -150,9 +150,14 @@ void set_realtime_priority() {
 }
 
 void set_realtime_latency() {
-    int32_t lat = 0; 
-    int latency_fd = open("/dev/cpu_dma_latency", O_RDWR);
-    if (latency_fd != -1){
+    // The kernel only honors the PM_QoS constraint while the fd remains open.
+    // Keep it in a static so it lives for the lifetime of the process.
+    static int latency_fd = -1;
+    if (latency_fd != -1) return;
+
+    int32_t lat = 0;
+    latency_fd = open("/dev/cpu_dma_latency", O_RDWR);
+    if (latency_fd != -1) {
         if (sizeof(lat) != write(latency_fd, &lat, sizeof(lat)))
         {
             printf("write() failed to write all bytes. errno = %d\n", errno);
