@@ -132,7 +132,8 @@ int create_candidate_pool(int set_idx, int required_candidates, uint8_t* huge_pa
         // Loop through the 8 combinations of bits 18, 19, 20
         for (uint64_t variation = 0; variation < 8; variation++) {
             uint64_t offset = (variation << 18) | (set_idx << SET_INDEX_SHIFT);
-            candidate_pool[pool_index++] = page_base + offset;
+            candidate_pool[pool_index] = page_base + offset;
+            pool_index++;
         }
     }
 
@@ -204,23 +205,22 @@ int bootstrap_page_alignment(uint8_t **candidate_pool, int total_candidates, uin
         int ev_size = 0;
         
         printf("[*] Testing Victim %d (Page %d)... ", victim_index, victim_page);
+        if (!find_eviction_set(victim, current_pool, current_pool_size, eviction_set, &ev_size)) {
+            victim_index++;
+            continue;
+        }
+        printf("Found minimal set of %d lines!\n", ev_size);
         
-        if (find_eviction_set(victim, current_pool, current_pool_size, eviction_set, &ev_size)) {
-            printf("Found minimal set of %d lines!\n", ev_size);
-            
-            // If this is the absolute first success, anchor Page 0 to Delta 0
-            if (mapped_count == 0) {
-                delta[0] = 0;
-                page_mapped[0] = true;
-                mapped_count = 1;
-            }
+        // If this is the absolute first success, anchor Page 0 to Delta 0
+        if (mapped_count == 0) {
+            delta[0] = 0;
+            page_mapped[0] = true;
+            mapped_count = 1;
+        }
 
-            // Attempt to bridge and calculate new deltas
-            if (!calculate_page_deltas(eviction_set, ev_size, pages, page_mapped, delta, &mapped_count)) {
-                printf("    [!] Valid set, but no bridge to previously mapped pages. Skipping.\n");
-            }
-        } else {
-            printf("Failed to find set.\n");
+        // Attempt to bridge and calculate new deltas
+        if (!calculate_page_deltas(eviction_set, ev_size, pages, page_mapped, delta, &mapped_count)) {
+            printf("    [!] Valid set, but no bridge to previously mapped pages. Skipping.\n");
         }
         
         victim_index++;
