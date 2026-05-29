@@ -71,14 +71,20 @@ bool test_group(uint8_t *victim, uint8_t **group, int size) {
     return measure_access_time(victim) >= MISS_THRESHOLD;
 }
 
+#ifndef ROBUST_TESTS
+#define ROBUST_TESTS 5
+#endif
+#ifndef ROBUST_THRESHOLD
+#define ROBUST_THRESHOLD 3
+#endif
+
 bool test_group_robust(uint8_t *victim, uint8_t **group, int size) {
     int misses = 0;
-    int tests = 5; 
-    for(int t = 0; t < tests; t++) {
+    for(int t = 0; t < ROBUST_TESTS; t++) {
         if (test_group(victim, group, size)) misses++;
     }
     // Return true only if it consistently evicts (majority vote)
-    return misses >= 3; 
+    return misses >= ROBUST_THRESHOLD;
 }
 
 // Phase 1: Robust Pruning Algorithm
