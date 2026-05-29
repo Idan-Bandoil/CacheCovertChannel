@@ -46,6 +46,7 @@ int main(int argc, char *argv[]) {
 
     // 1. Allocate Memory & Find Set (Happens exactly ONCE)
     printf("[*] Allocating memory and searching for eviction set...\n");
+    ensure_huge_pages_available(NUM_HUGE_PAGES);
     uint8_t *base_addr = (uint8_t*)allocate_huge_pages(NUM_HUGE_PAGES);
 
     int required_lines = EVICTION_SET_SIZE + 1;

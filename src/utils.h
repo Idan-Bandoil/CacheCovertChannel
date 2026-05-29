@@ -23,6 +23,11 @@ void set_realtime_priority();
 void set_realtime_latency();
 
 // --- Memory management ---
+// Pre-flight: ensure at least num_pages huge pages are FREE in the kernel pool.
+// If short, bumps /proc/sys/vm/nr_hugepages by the deficit. Call once at
+// startup, before any allocate_huge_pages() call, so the pool is sized for
+// everything this process will need.
+void ensure_huge_pages_available(size_t num_pages);
 void* allocate_huge_pages(size_t num_pages);
 uint64_t virt_to_phys(void *virtual_address);
 

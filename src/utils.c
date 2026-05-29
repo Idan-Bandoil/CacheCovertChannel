@@ -56,34 +56,89 @@ void shuffle_addresses_randomly(uint8_t** addresses, int addresses_count)
     }
 }
 
+// Read /proc/sys/vm/nr_hugepages.
+static size_t read_nr_hugepages(void) {
+    FILE *f = fopen("/proc/sys/vm/nr_hugepages", "r");
+    if (!f) return 0;
+    size_t v = 0;
+    if (fscanf(f, "%zu", &v) != 1) v = 0;
+    fclose(f);
+    return v;
+}
+
+// Read HugePages_Free from /proc/meminfo.
+static size_t read_hugepages_free(void) {
+    FILE *f = fopen("/proc/meminfo", "r");
+    if (!f) return 0;
+    char line[256];
+    size_t free_pages = 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (sscanf(line, "HugePages_Free: %zu", &free_pages) == 1) break;
+    }
+    fclose(f);
+    return free_pages;
+}
+
+// Bump /proc/sys/vm/nr_hugepages by `delta`. Always additive — never shrinks.
+static int grow_huge_pool(size_t delta) {
+    size_t current = read_nr_hugepages();
+    size_t target = current + delta;
+    char cmd[128];
+    snprintf(cmd, sizeof(cmd), "echo %zu | sudo tee /proc/sys/vm/nr_hugepages > /dev/null", target);
+    return system(cmd);
+}
+
+void ensure_huge_pages_available(size_t num_pages) {
+    size_t free_pages = read_hugepages_free();
+    if (free_pages >= num_pages) return;
+
+    size_t deficit = num_pages - free_pages;
+    printf("[*] Huge page pool short by %zu (free=%zu, need=%zu). Growing pool...\n",
+           deficit, free_pages, num_pages);
+    if (grow_huge_pool(deficit) != 0) {
+        perror("[-] Failed to grow huge page pool. Run as root or extend sudoers");
+        exit(EXIT_FAILURE);
+    }
+
+    size_t free_after = read_hugepages_free();
+    if (free_after < num_pages) {
+        fprintf(stderr,
+                "[-] Pool growth requested but free count still %zu < %zu. "
+                "Likely memory fragmentation; reboot or reduce NUM_PAGES.\n",
+                free_after, num_pages);
+        exit(EXIT_FAILURE);
+    }
+    printf("[+] Pool grown. HugePages_Free=%zu.\n", free_after);
+}
+
 void* allocate_huge_pages(size_t num_pages) {
     size_t size = num_pages * HUGE_PAGE_SIZE;
-    void *ptr = mmap(NULL, size, PROT_READ | PROT_WRITE, 
+    void *ptr = mmap(NULL, size, PROT_READ | PROT_WRITE,
                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
 
     if (ptr == MAP_FAILED) {
-        printf("[!] Huge pages not available. Attempting to allocate %zu pages via OS...\n", num_pages);
-        
-        char cmd[128];
-        snprintf(cmd, sizeof(cmd), "echo %zu | sudo tee /proc/sys/vm/nr_hugepages > /dev/null", num_pages);
-        if (system(cmd) != 0) {
-            perror("[-] Failed to allocate huge pages. Ensure you run as root");
+        // Fallback path: pool wasn't pre-sized (or got drained mid-process).
+        // Grow the pool ADDITIVELY by num_pages — never overwrite the count,
+        // or in-process allocations will starve each other.
+        printf("[!] Huge pages exhausted. Growing pool by %zu...\n", num_pages);
+        if (grow_huge_pool(num_pages) != 0) {
+            perror("[-] Failed to grow huge page pool. Ensure you run as root");
             exit(EXIT_FAILURE);
         }
 
-        ptr = mmap(NULL, size, PROT_READ | PROT_WRITE, 
+        ptr = mmap(NULL, size, PROT_READ | PROT_WRITE,
                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
         if (ptr == MAP_FAILED) {
             perror("[-] Huge pages allocation still failed");
             exit(EXIT_FAILURE);
         }
     }
-    
+
     // Fault pages into physical memory
     for (size_t i = 0; i < num_pages; i++) {
         ((volatile char*)ptr)[i * HUGE_PAGE_SIZE] = 'A';
     }
-    
+
     printf("[+] Successfully allocated %zu huge pages.\n", num_pages);
     return ptr;
 }

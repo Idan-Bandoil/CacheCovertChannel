@@ -33,6 +33,7 @@ int main(int argc, char *argv[]) {
     set_realtime_latency();
 
     printf("[*] Allocating memory and searching for negative control set...\n");
+    ensure_huge_pages_available(NUM_HUGE_PAGES);
     uint8_t *base_addr = (uint8_t*)allocate_huge_pages(NUM_HUGE_PAGES);
 
     void *victim = NULL; 

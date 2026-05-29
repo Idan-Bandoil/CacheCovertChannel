@@ -285,6 +285,9 @@ int main(int argc, char *argv[]) {
     set_realtime_priority();
     set_realtime_latency();
 
+    // NUM_PAGES for the bootstrap arena + 2 for init_l2_wash().
+    ensure_huge_pages_available(NUM_PAGES + 2);
+
     uint8_t *pages = (uint8_t*)allocate_huge_pages(NUM_PAGES);
 
     init_l2_wash();
