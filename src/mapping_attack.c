@@ -17,10 +17,10 @@ void init_l2_wash() {
     // Allocate 2 huge pages (4MB) just for wash data
     uint8_t *wash_memory = (uint8_t*)allocate_huge_pages(2);
     int ptr = 0;
-    
+
     for (uint64_t off = 0; off < 2 * HUGE_PAGE_SIZE && ptr < L2_WASH_LINES; off += CACHE_LINE_SIZE) {
         int set = (off >> SET_INDEX_SHIFT) & SET_INDEX_MASK;
-        // CRITICAL: We dodge our target L3 set! 
+        // CRITICAL: We dodge our target L3 set!
         if (set != BOOTSTRAP_SET) {
             l2_wash_pool[ptr++] = wash_memory + off;
         }
@@ -281,6 +281,14 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     int core_id = atoi(argv[1]);
+
+    // Fully buffer stdout. The per-victim status prints in
+    // bootstrap_page_alignment otherwise force a write() syscall per
+    // iteration, which can deschedule the measurement core and pollute cache
+    // state. We fflush() at phase boundaries below so progress is still
+    // visible to a human watcher.
+    setvbuf(stdout, NULL, _IOFBF, 0);
+
     pin_cpu(core_id);
     set_realtime_priority();
     set_realtime_latency();
@@ -291,7 +299,8 @@ int main(int argc, char *argv[]) {
     uint8_t *pages = (uint8_t*)allocate_huge_pages(NUM_PAGES);
 
     init_l2_wash();
-    
+    fflush(stdout);  // setup status out before the (long, quiet) bootstrap
+
     int total_candidates = NUM_PAGES * 8;
     uint8_t **candidate_pool = malloc(sizeof(uint8_t*) * total_candidates);
     if (!create_candidate_pool(BOOTSTRAP_SET, total_candidates, pages, &candidate_pool))
@@ -307,6 +316,7 @@ int main(int argc, char *argv[]) {
     int mapped_count = bootstrap_page_alignment(candidate_pool, total_candidates, pages, page_mapped, delta);
 
     print_page_alignments(page_mapped, delta, mapped_count);
+    fflush(stdout);  // alignment summary out before Phase 3 starts
 
     // =========================================
     // PHASE 3: O(1) MATHEMATICAL BUCKETING
