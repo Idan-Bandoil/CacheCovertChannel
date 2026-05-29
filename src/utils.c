@@ -173,16 +173,28 @@ uint64_t measure_access_time(volatile void *addr) {
     uint64_t start, end;
     unsigned int aux;
 
-    _mm_mfence();
+    // Drain prior loads before reading the TSC. lfence is sufficient on Intel
+    // since Sandy Bridge — it serialises with respect to older loads, which is
+    // all we need: this function is called from load-only hot paths (wash +
+    // sweep), so there is no pending store the heavier mfence would have to
+    // drain. The second lfence prevents the timed load from issuing ahead of
+    // rdtsc.
     _mm_lfence();
     start = __rdtsc();
     _mm_lfence();
 
     (void)*(volatile uint8_t *)addr;
 
+    // The lfence here forces the timed load to retire before rdtscp executes,
+    // tightening the upper edge of the measurement window. rdtscp is itself
+    // pseudo-serialising (waits for older instructions to retire before reading
+    // the counter) — the fence is defensive but cheap. The trailing lfence
+    // stops the next-iteration code from issuing ahead of rdtscp; in a tight
+    // measurement loop this matters more than a trailing mfence (mfence's
+    // store-buffer drain costs cycles we never use).
     _mm_lfence();
     end = __rdtscp(&aux);
-    _mm_mfence();
+    _mm_lfence();
 
     return end - start;
 }
