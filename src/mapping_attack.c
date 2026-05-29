@@ -35,12 +35,6 @@ void wash_l2() {
     }
 }
 
-// Macro for TLB warmup
-#define WARM_TLB(addr) do { \
-    volatile uint8_t dummy = *((volatile uint8_t*)(((uintptr_t)(addr)) ^ 0x800)); \
-    (void)dummy; \
-} while(0)
-
 // Helper: Calculate the slice hash using ONLY bits 0-20.
 // Because it's an XOR function, the zeroed upper bits have no effect on the known bits' sum.
 int get_known_hash(void *vaddr) {
@@ -67,7 +61,7 @@ bool test_group(uint8_t *victim, uint8_t **group, int size) {
         wash_l2();
     }
 
-    WARM_TLB(victim);
+    warm_tlb(victim);
     return measure_access_time(victim) >= MISS_THRESHOLD;
 }
 

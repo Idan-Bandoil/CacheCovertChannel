@@ -9,16 +9,11 @@
 #define TARGET_SET 0x5A
 #define DUMMY_SET  0x5B // Intentionally picking a DIFFERENT set for the dummy lines
 
-#define CACHE_MISS_THRESHOLD 150 
+#define CACHE_MISS_THRESHOLD 150
 #define CACHE_HIT_THRESHOLD 100
 #define EVICTION_SET_SIZE (LLC_WAYS * 3) // 36 lines, as requested
 
 #define TEST_ITERATIONS 100000
-
-#define WARM_TLB(addr) do { \
-    volatile uint8_t dummy = *((volatile uint8_t*)(((uintptr_t)(addr)) ^ 0x800)); \
-    (void)dummy; \
-} while(0)
 
 int main(int argc, char *argv[]) {
     if (argc < 2) {
@@ -100,7 +95,7 @@ search_done:
             for (int i = EVICTION_SET_SIZE - 1; i >= 0; i--) maccess(dummy_set[i]);
         }
 
-        WARM_TLB(victim);
+        warm_tlb(victim);
         uint64_t post_dummy_time = measure_access_time(victim);
 
         sum_hit_time += hit_time;

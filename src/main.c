@@ -21,16 +21,10 @@
 // and will be excluded from the mean calculations.
 #define OUTLIER_THRESHOLD MISS_MAX_CYCLES 
 
-#define EVICTION_SET_SIZE (LLC_WAYS * 3) 
+#define EVICTION_SET_SIZE (LLC_WAYS * 3)
 
 // --- Testing Configuration ---
 #define TEST_ITERATIONS 100000
-
-// Helper macro to warm up the TLB without touching the victim cache line
-#define WARM_TLB(addr) do { \
-    volatile uint8_t dummy = *((volatile uint8_t*)(((uintptr_t)(addr)) ^ 0x800)); \
-    (void)dummy; \
-} while(0)
 
 int main(int argc, char *argv[]) {
     if (argc < 2) {
@@ -111,7 +105,7 @@ search_done:
         }
 
         // Step D: Warm TLB and measure the victim again
-        WARM_TLB(victim);
+        warm_tlb(victim);
         uint64_t miss_time = measure_access_time(victim);
 
         // Record Statistics for Hit Time
