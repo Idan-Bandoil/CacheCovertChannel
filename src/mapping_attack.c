@@ -1,13 +1,53 @@
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <stdbool.h>
 #include "utils.h"
+#ifdef PROBE_TIMING
+#include <x86intrin.h>   /* _mm_clflush for the timing-distribution probe */
+#endif
+#if defined(NO_PREFETCH) || defined(FREQ_PROBE)
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+#ifdef FREQ_PROBE
+#include <time.h>
+#endif
+#ifdef NO_PREFETCH
+// Measurement only (-DNO_PREFETCH): toggle the four Intel HW prefetchers on the
+// pinned core via MSR 0x1A4 (MSR_MISC_FEATURE_CONTROL): bit0 L2 HWP, bit1 L2
+// adjacent-line, bit2 DCU (L1), bit3 DCU-IP. 0xF disables all four. The binary
+// runs as root (via sudoers), so it can open /dev/cpu/<core>/msr directly.
+// ALWAYS restored to 0x0 on exit (atexit) so the machine is left untouched.
+static int g_msr_core = -1;
+static uint64_t rd_1a4(int core) {
+    char p[64]; snprintf(p, sizeof(p), "/dev/cpu/%d/msr", core);
+    int fd = open(p, O_RDONLY); if (fd < 0) return ~0ull;
+    uint64_t v = ~0ull; if (pread(fd, &v, 8, 0x1A4) != 8) v = ~0ull;
+    close(fd); return v;
+}
+static void wr_1a4(int core, uint64_t v) {
+    char p[64]; snprintf(p, sizeof(p), "/dev/cpu/%d/msr", core);
+    int fd = open(p, O_WRONLY); if (fd < 0) { perror("[-] open msr"); return; }
+    if (pwrite(fd, &v, 8, 0x1A4) != 8) perror("[-] pwrite msr 0x1A4");
+    close(fd);
+}
+static void restore_prefetch(void) {
+    if (g_msr_core < 0) return;
+    wr_1a4(g_msr_core, 0x0ull);
+    printf("[*] NO_PREFETCH: restored MSR 0x1A4=0x%llx on core %d\n",
+           (unsigned long long)rd_1a4(g_msr_core), g_msr_core);
+    fflush(stdout);
+}
+#endif
 
 #define NUM_PAGES 100
 #define BOOTSTRAP_SET 0x5A
 #define TARGET_EVICTION_COUNT (LLC_WAYS * 2)
+#ifndef MISS_THRESHOLD
 #define MISS_THRESHOLD 150
+#endif
 
 // Self-validating bootstrap retry. The two parity cosets are physically ~50/50,
 // so a healthy run maps a comparable number of pages to each. A badly skewed
@@ -293,7 +333,10 @@ bool in_any_anchored_slice(uint8_t *victim, int victim_page,
 int remap_round(uint8_t *pages, bool *page_mapped, int *delta, int *mapped_count) {
     int snap_delta[NUM_PAGES];
     bool snap_mapped[NUM_PAGES];
-    for (int p = 0; p < NUM_PAGES; p++) { snap_delta[p] = delta[p]; snap_mapped[p] = page_mapped[p]; }
+    for (int p = 0; p < NUM_PAGES; p++) { 
+        snap_delta[p] = delta[p]; 
+        snap_mapped[p] = page_mapped[p]; 
+    }
 
     int changed = 0;
     for (int p = 0; p < NUM_PAGES; p++) {
@@ -303,11 +346,17 @@ int remap_round(uint8_t *pages, bool *page_mapped, int *delta, int *mapped_count
             uint8_t *oracle[TARGET_EVICTION_COUNT];
             int n = build_relslice_set(BOOTSTRAP_SET, s, pages, snap_mapped, snap_delta,
                                        p, TARGET_EVICTION_COUNT, oracle);
-            if (n >= LLC_WAYS && evicts_strict(v, oracle, n)) { matches++; match_s = s; }
+            if (n >= LLC_WAYS && evicts_strict(v, oracle, n)) { 
+                matches++; 
+                match_s = s;
+            }
         }
         if (matches != 1) continue;   // ambiguous / unclaimed: leave for a later round
         int nd = get_known_hash(v) ^ match_s;   // rel_slice = H_K ^ delta = match_s
-        if (!page_mapped[p]) { page_mapped[p] = true; (*mapped_count)++; changed++; }
+        if (!page_mapped[p]) { 
+            page_mapped[p] = true; 
+            (*mapped_count)++; changed++; 
+        }
         else if (delta[p] != nd) changed++;
         delta[p] = nd;
     }
@@ -476,8 +525,27 @@ void print_page_alignments(bool* page_mapped, int* delta, int mapped_count)
     for (int i = 0; i < NUM_PAGES; i++) {
         if (page_mapped[i]) coset_pages[__builtin_parity(delta[i])]++;
     }
-    printf("Coset 0 (even delta {0,3,5,6}): %d pages\n", coset_pages[0]);
-    printf("Coset 1 (odd  delta {1,2,4,7}): %d pages\n", coset_pages[1]);
+
+    // Which 4 slices each coset's pages occupy is COMPUTED from the slice hash,
+    // not hardcoded. A page's reachable rel-slices are { get_known_hash(var) ^
+    // delta }; the in-page variation bits contribute parity 0 (Eq. 7), so every
+    // bootstrap candidate shares one known-hash parity and the reachable set
+    // depends only on the delta's parity -- coset c (delta parity c) occupies
+    // slices { get_known_hash(var) ^ c }. We enumerate that directly so the
+    // labels stay correct for any BOOTSTRAP_SET. (The old hardcoded text had the
+    // two cosets backwards: at set 0x5A every candidate's known-hash is odd, so
+    // even-delta pages live in the ODD slices {1,2,4,7}, not {0,3,5,6}.)
+    bool coset_slices[NUM_PARITY_COSETS][NUM_SLICES] = {{false}};
+    for (uint64_t var = 0; var < 8; var++) {
+        int h = get_known_hash((void *)(uintptr_t)((var << 18) | (BOOTSTRAP_SET << SET_INDEX_SHIFT)));
+        for (int c = 0; c < NUM_PARITY_COSETS; c++) coset_slices[c][h ^ c] = true;
+    }
+    for (int c = 0; c < NUM_PARITY_COSETS; c++) {
+        printf("Coset %d (%s delta -> slices {", c, c ? "odd " : "even");
+        for (int s = 0, first = 1; s < NUM_SLICES; s++)
+            if (coset_slices[c][s]) { printf("%s%d", first ? "" : ",", s); first = 0; }
+        printf("}): %d pages\n", coset_pages[c]);
+    }
     printf("Successfully aligned %d/%d pages across %d/%d parity cosets.\n",
            mapped_count, NUM_PAGES,
            (coset_pages[0] > 0) + (coset_pages[1] > 0), NUM_PARITY_COSETS);
@@ -497,6 +565,26 @@ int build_target_eviction_set(int target_set, int target_slice, uint8_t *pages,
                               -1, TARGET_EVICTION_COUNT, eviction_set_out);
 }
 
+#if defined(PROBE_TIMING) || defined(FREQ_PROBE)
+static int cmp_u64(const void *a, const void *b) {
+    uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+    return (x > y) - (x < y);
+}
+#endif
+#ifdef PROBE_TIMING
+// Order statistics + threshold-crossing rate for a sample of TSC-tick deltas.
+// `above` selects which crossing is the error: 1 => count v >= thr (false MISS
+// for a cache-resident sample), 0 => count v < thr (false HIT for a DRAM sample).
+static void print_dist(const char *name, uint64_t *v, int n, int thr, int above) {
+    qsort(v, n, sizeof(uint64_t), cmp_u64);
+    int cross = 0; double s = 0;
+    for (int i = 0; i < n; i++) { s += v[i]; if (above ? (v[i] >= thr) : (v[i] < thr)) cross++; }
+    printf("  %-9s n=%d min=%lu p1=%lu p10=%lu med=%lu p90=%lu p99=%lu max=%lu mean=%.1f | %s%d: %d (%.1f%%)\n",
+           name, n, v[0], v[n/100], v[n/10], v[n/2], v[(int)(n*0.90)], v[(int)(n*0.99)], v[n-1], s/n,
+           above ? ">=" : "<", thr, cross, 100.0 * cross / n);
+}
+#endif
+
 int main(int argc, char *argv[]) {
     if (argc < 2) {
         printf("Usage: %s <core_id>\n", argv[0]);
@@ -512,6 +600,14 @@ int main(int argc, char *argv[]) {
     setvbuf(stdout, NULL, _IOFBF, 0);
 
     pin_cpu(core_id);
+#ifdef NO_PREFETCH
+    g_msr_core = core_id;
+    printf("[*] NO_PREFETCH: MSR 0x1A4 before = 0x%llx\n", (unsigned long long)rd_1a4(core_id));
+    wr_1a4(core_id, 0xFull);
+    printf("[*] NO_PREFETCH: MSR 0x1A4 after  = 0x%llx (0xf => all 4 HW prefetchers OFF)\n",
+           (unsigned long long)rd_1a4(core_id));
+    atexit(restore_prefetch);   // leave the machine untouched no matter how we exit
+#endif
     set_realtime_priority();
     set_realtime_latency();
 
@@ -522,6 +618,80 @@ int main(int argc, char *argv[]) {
 
     init_l2_wash();
     fflush(stdout);  // setup status out before the (long, quiet) bootstrap
+
+#ifdef PROBE_TIMING
+    // -----------------------------------------------------------------------
+    // Timing-distribution probe (measurement only; -DPROBE_TIMING). Uses the
+    // REAL measure_access_time + wash_l2 on THIS core to characterise the two
+    // distributions MISS_THRESHOLD must separate:
+    //   survivor : a cache-resident line (washed down to L2/L3) -- the "victim
+    //              survived" case; must read BELOW threshold to be a HIT.
+    //   dram     : a clflush'd line -- the "victim evicted" case; must read
+    //              AT/ABOVE threshold to be a MISS.
+    // The crossing-rate column is the per-core false-miss / false-hit rate the
+    // fixed threshold induces -- exactly what gates the attack's stability.
+    {
+        const int NS = 2000;
+        uint64_t *l1 = malloc(NS * sizeof(uint64_t));
+        uint64_t *sv = malloc(NS * sizeof(uint64_t));
+        uint64_t *dr = malloc(NS * sizeof(uint64_t));
+        uint8_t *probe = pages + 0x1000 * CACHE_LINE_SIZE; // arbitrary mapped line
+        for (int i = 0; i < NS; i++) {
+            maccess(probe); maccess(probe);              // L1-resident
+            warm_tlb(probe); l1[i] = measure_access_time(probe);
+
+            maccess(l2_wash_pool[0]); wash_l2();         // pushed down to L2/L3
+            warm_tlb(l2_wash_pool[0]); sv[i] = measure_access_time(l2_wash_pool[0]);
+
+            _mm_clflush(probe);                          // forced to DRAM
+            warm_tlb(probe); dr[i] = measure_access_time(probe);
+        }
+        printf("\n===== TIMING PROBE (core %d, MISS_THRESHOLD=%d) =====\n", core_id, MISS_THRESHOLD);
+        print_dist("l1hit",    l1, NS, MISS_THRESHOLD, 1);  // expect ~0% >= thr
+        print_dist("survivor", sv, NS, MISS_THRESHOLD, 1);  // false-MISS rate
+        print_dist("dram",     dr, NS, MISS_THRESHOLD, 0);  // false-HIT  rate
+        printf("=====================================================\n");
+        fflush(stdout);
+        free(l1); free(sv); free(dr);
+        return 0;
+    }
+#endif
+
+#ifdef FREQ_PROBE
+    // Delivered-core-frequency probe (measurement only; -DFREQ_PROBE). Reads
+    // IA32_APERF (MSR 0xE8 = actual core clock ticks) around attack-like memory
+    // load (wash_l2) and divides by CLOCK_MONOTONIC wall time -> the frequency
+    // the core ACTUALLY delivers, sampled sub-millisecond. This is the
+    // high-resolution view that scaling_cur_freq (20 Hz, time-averaged) hides.
+    {
+        char mp[64]; snprintf(mp, sizeof(mp), "/dev/cpu/%d/msr", core_id);
+        int fd = open(mp, O_RDONLY);
+        if (fd < 0) { perror("[-] FREQ_PROBE open msr (need msr module + root)"); return 1; }
+        enum { NS = 2500, WPS = 6 };
+        static uint64_t mhz[NS];
+        struct timespec t0, t1; uint64_t a0, a1;
+        if (pread(fd, &a0, 8, 0xE8) != 8) { perror("[-] pread APERF"); return 1; }
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        for (int i = 0; i < NS; i++) {
+            for (int w = 0; w < WPS; w++) wash_l2();   // attack-like memory load
+            pread(fd, &a1, 8, 0xE8);
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            double dt = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
+            mhz[i] = dt > 0 ? (uint64_t)((double)(a1 - a0) / dt / 1e6) : 0;
+            a0 = a1; t0 = t1;
+        }
+        close(fd);
+        qsort(mhz, NS, sizeof(uint64_t), cmp_u64);
+        double s = 0; for (int i = 0; i < NS; i++) s += mhz[i];
+        printf("\n===== FREQ PROBE (core %d, delivered core MHz under wash load, n=%d) =====\n", core_id, NS);
+        printf("  min=%lu p1=%lu p10=%lu med=%lu p90=%lu p99=%lu max=%lu mean=%.0f spread(p99-p1)=%lu\n",
+               mhz[0], mhz[NS/100], mhz[NS/10], mhz[NS/2], mhz[(int)(NS*0.90)],
+               mhz[(int)(NS*0.99)], mhz[NS-1], s / NS, mhz[(int)(NS*0.99)] - mhz[NS/100]);
+        printf("=========================================================================\n");
+        fflush(stdout);
+        return 0;
+    }
+#endif
 
     int total_candidates = NUM_PAGES * 8;
     uint8_t **candidate_pool = malloc(sizeof(uint8_t*) * total_candidates);
@@ -602,9 +772,9 @@ int main(int argc, char *argv[]) {
     // across the two cosets (even {0,3,5,6} vs odd {1,2,4,7}), so verifying ALL
     // slices is the end-to-end proof that BOTH parity groups were recovered --
     // the whole point of escaping parity blindness.
-    printf("[*] Phase 3: building + verifying an eviction set for every slice of set 0x%03X...\n", 0x8);
+    int target_set = 0x34;   // any set (0..4095)
+    printf("[*] Phase 3: building + verifying an eviction set for every slice of set 0x%03X...\n", target_set);
 
-    int target_set = 0x8;   // any set (0..4095)
     int verified = 0, buildable = 0;
 #ifdef GROUND_TRUTH
     int correct_sets = 0;
