@@ -6,3 +6,11 @@ eviction_builder
 negative_control
 
 mapping_attack
+
+docs/
+
+system-prompt-extraction/HANDOFF.md
+
+slice_oracle
+
+slice_contention
